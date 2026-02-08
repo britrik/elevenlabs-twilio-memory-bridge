@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "license": "MIT",
   "description": "A lightweight production bridge that connects ElevenLabs Conversational AI agents with Twilio phone numbers, adding dynamic memory injection and persistent caller sessions. When a call arrives, ElevenLabs' native Twilio integration triggers your personalization webhook, which injects caller-specific long-term memory, daily context notes, and a customizable soul/personality template — all without proxying audio. Supports OpenClaw (or any OpenAI-compatible) backend as the LLM, Cloudflare Tunnel for secure exposure, and simple file-based persistence with zero external dependencies.",
-  "author": "rikhe",
+  "author": "britrik",
   "homepage": "https://github.com/britrik/elevenlabs-twilio-memory-bridge",
   "repository": "https://github.com/britrik/elevenlabs-twilio-memory-bridge",
   "tags": [
