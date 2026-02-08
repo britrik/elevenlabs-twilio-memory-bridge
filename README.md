@@ -56,7 +56,7 @@ A lightweight production bridge that adds **persistent caller memory** and **dyn
 ### 1. Clone & install
 
 ```bash
-git clone https://github.com/rikhe/elevenlabs-twilio-memory-bridge.git
+git clone https://github.com/britrik/elevenlabs-twilio-memory-bridge.git
 cd elevenlabs-twilio-memory-bridge
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
