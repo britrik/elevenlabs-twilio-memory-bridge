@@ -1,0 +1,29 @@
+{
+  "name": "ElevenLabs Twilio Memory Bridge",
+  "slug": "elevenlabs-twilio-memory-bridge",
+  "version": "1.0.0",
+  "license": "MIT",
+  "description": "FastAPI personalization webhook that adds persistent caller memory and dynamic context injection to ElevenLabs Conversational AI agents on Twilio. No audio proxying, file-based persistence, OpenClaw compatible.",
+  "author": "britrik",
+  "homepage": "https://github.com/britrik/elevenlabs-twilio-memory-bridge",
+  "repository": "https://github.com/britrik/elevenlabs-twilio-memory-bridge",
+  "tags": [
+    "elevenlabs",
+    "twilio",
+    "voice-agent",
+    "telephony",
+    "conversational-ai",
+    "memory-injection",
+    "fastapi"
+  ],
+  "categories": [
+    "telephony",
+    "voice-ai",
+    "integrations"
+  ],
+  "runtime": "python",
+  "python_version": ">=3.10",
+  "entry_point": "app.py",
+  "install_command": "pip install -r requirements.txt",
+  "run_command": "uvicorn app:app --host 0.0.0.0 --port 8000"
+}
