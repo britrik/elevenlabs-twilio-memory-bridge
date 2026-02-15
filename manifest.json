@@ -1,7 +1,7 @@
 {
   "name": "ElevenLabs Twilio Memory Bridge",
   "slug": "elevenlabs-twilio-memory-bridge",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "license": "MIT",
   "description": "FastAPI personalization webhook that adds persistent caller memory and dynamic context injection to ElevenLabs Conversational AI agents on Twilio. No audio proxying, file-based persistence, OpenClaw compatible.",
   "author": "britrik",
@@ -43,6 +43,10 @@
       {
         "key": "PUBLIC_BASE_URL",
         "description": "Publicly reachable URL of this bridge service"
+      },
+      {
+        "key": "ADMIN_API_KEY",
+        "description": "Secret key for admin endpoint authentication (Bearer token)"
       }
     ],
     "optional_env": [
@@ -59,6 +63,10 @@
         "key": "DATA_DIR",
         "description": "Directory for JSON persistence",
         "default": "./data"
+      },
+      {
+        "key": "ALLOWED_ORIGINS",
+        "description": "Comma-separated list of allowed CORS origins (leave unset to disable CORS)"
       },
       {
         "key": "HOST",

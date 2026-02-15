@@ -31,7 +31,7 @@ from typing import AsyncIterator
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -55,6 +55,8 @@ ELEVENLABS_AGENT_ID: str = os.getenv("ELEVENLABS_AGENT_ID", "")
 OPENCLAW_API_BASE_URL: str = os.getenv("OPENCLAW_API_BASE_URL", "")
 PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "")
 WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "")
+ADMIN_API_KEY: str = os.getenv("ADMIN_API_KEY", "")
+ALLOWED_ORIGINS: str = os.getenv("ALLOWED_ORIGINS", "")
 SOUL_TEMPLATE_PATH: str = os.getenv("SOUL_TEMPLATE_PATH", "./soul_template.md")
 DATA_DIR: str = os.getenv("DATA_DIR", "./data")
 HOST: str = os.getenv("HOST", "0.0.0.0")
@@ -271,6 +273,40 @@ def build_personalization_response(
     }
 
 
+# ── Auth dependency ──────────────────────────────────────────────────────────
+
+
+async def verify_admin_api_key(
+    authorization: str | None = Header(default=None),
+) -> None:
+    """Verify the admin API key from the Authorization header.
+
+    Raises HTTP 403 if ADMIN_API_KEY is not configured.
+    Raises HTTP 401 if the key is missing or invalid.
+    """
+    if not ADMIN_API_KEY:
+        raise HTTPException(
+            status_code=403,
+            detail="ADMIN_API_KEY is not configured. Admin endpoints are disabled.",
+        )
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing Authorization header. Use: Authorization: Bearer <key>",
+        )
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid Authorization header format. Use: Authorization: Bearer <key>",
+        )
+    if not hmac.compare_digest(token, ADMIN_API_KEY):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key.",
+        )
+
+
 # ── Lifespan ────────────────────────────────────────────────────────────────
 
 
@@ -284,6 +320,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("Bridge starting — agent_id=%s", ELEVENLABS_AGENT_ID or "(not set)")
     logger.info("Public URL: %s", PUBLIC_BASE_URL or "(not set)")
     logger.info("Data dir:   %s", Path(DATA_DIR).resolve())
+    if not WEBHOOK_SECRET:
+        logger.warning(
+            "WEBHOOK_SECRET is not configured — webhook signature verification is DISABLED. "
+            "Set WEBHOOK_SECRET and configure the same secret in ElevenLabs to verify HMAC signatures."
+        )
+    else:
+        logger.info("Webhook signature verification is enabled.")
     yield
     logger.info("Bridge shutting down")
 
@@ -292,7 +335,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="ElevenLabs–Twilio Memory Bridge",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Personalization webhook for ElevenLabs' native Twilio integration. "
         "Injects caller memory and personality into each conversation."
@@ -300,13 +343,20 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if ALLOWED_ORIGINS:
+    _origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
+    if _origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=_origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+    else:
+        logger.warning(
+            "ALLOWED_ORIGINS was set but no valid origins were parsed; CORS disabled."
+        )
 
 
 # ── Endpoints ───────────────────────────────────────────────────────────────
@@ -411,14 +461,14 @@ async def post_call(
     return {"status": "ok"}
 
 
-@app.post("/api/memory/{phone_hash}")
+@app.post("/api/memory/{phone_hash}", dependencies=[Depends(verify_admin_api_key)])
 async def api_add_memory(phone_hash: str, body: AddMemoryRequest) -> dict:
     """Add a long-term memory fact for a caller identified by phone hash."""
     facts = add_memory(phone_hash, body.fact)
     return {"status": "ok", "phone_hash": phone_hash, "total_facts": len(facts)}
 
 
-@app.post("/api/notes")
+@app.post("/api/notes", dependencies=[Depends(verify_admin_api_key)])
 async def api_add_note(body: AddNoteRequest) -> dict:
     """Add a daily or global context note.
 
