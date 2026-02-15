@@ -21,7 +21,7 @@ def tmp_data_dir(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
-def configured_app(tmp_data_dir, monkeypatch):
+def configured_app(tmp_data_dir, monkeypatch):  # noqa: ARG001
     """Return a TestClient whose app has ADMIN_API_KEY set to a known value.
 
     The key is ``"test-secret-key"`` — tests that need a specific key should
@@ -32,14 +32,14 @@ def configured_app(tmp_data_dir, monkeypatch):
 
 
 @pytest.fixture()
-def unconfigured_app(tmp_data_dir, monkeypatch):
+def unconfigured_app(tmp_data_dir, monkeypatch):  # noqa: ARG001
     """Return a TestClient whose app has ADMIN_API_KEY empty (unconfigured)."""
     monkeypatch.setattr(app_module, "ADMIN_API_KEY", "")
     return TestClient(app_module.app, raise_server_exceptions=False)
 
 
 @pytest.fixture()
-def configured_client_factory(tmp_data_dir, monkeypatch):
+def configured_client_factory(tmp_data_dir, monkeypatch):  # noqa: ARG001
     """Factory fixture: returns a (client, key) tuple for a given ADMIN_API_KEY value."""
 
     def _make(api_key: str):

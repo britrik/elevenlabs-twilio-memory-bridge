@@ -332,7 +332,7 @@ class TestAuthEdgeCases:
 
     def test_whitespace_key_exact_match_accepted(self, configured_client_factory):
         """If ADMIN_API_KEY is whitespace, sending that exact whitespace should succeed."""
-        client, _ = configured_client_factory("   ")
+        client, _ = configured_client_factory("   ")  # noqa: RUF -- key unused intentionally
         resp = client.post(
             "/api/notes",
             json={"note": "test"},

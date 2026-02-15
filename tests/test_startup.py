@@ -31,7 +31,7 @@ async def _run_lifespan_startup():
     await ctx.__aexit__(None, None, None)
 
 
-def test_warning_when_webhook_secret_not_set(tmp_data_dir, monkeypatch, caplog):
+def test_warning_when_webhook_secret_not_set(tmp_data_dir, monkeypatch, caplog):  # noqa: ARG001
     """Requirement 3.1: WARNING logged when WEBHOOK_SECRET is not configured."""
     monkeypatch.setattr(app_module, "WEBHOOK_SECRET", "")
 
@@ -45,7 +45,7 @@ def test_warning_when_webhook_secret_not_set(tmp_data_dir, monkeypatch, caplog):
     ), "Expected a WARNING about WEBHOOK_SECRET not being configured"
 
 
-def test_info_when_webhook_secret_is_set(tmp_data_dir, monkeypatch, caplog):
+def test_info_when_webhook_secret_is_set(tmp_data_dir, monkeypatch, caplog):  # noqa: ARG001
     """Requirement 3.2: INFO logged when WEBHOOK_SECRET is configured."""
     monkeypatch.setattr(app_module, "WEBHOOK_SECRET", "some-secret-value")
 
