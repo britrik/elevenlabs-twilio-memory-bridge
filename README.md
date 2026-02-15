@@ -91,13 +91,17 @@ cp .env.example .env
 3. Assign it to your configured agent
 4. ElevenLabs automatically configures Twilio webhooks — no manual TwiML setup needed
 
-### 5. Run the service
+### 5. Review the soul template
+
+> **⚠️ Warning:** The `soul_template.md` file defines the agent's personality and system prompt. Soul templates can contain sensitive personal details. Review and customize this file before deploying to production.
+
+### 6. Run the service
 
 ```bash
 uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
-### 6. Expose publicly
+### 7. Expose publicly
 
 **Cloudflare Tunnel (recommended for production):**
 ```bash
@@ -111,7 +115,7 @@ ngrok http 8000
 
 Update `PUBLIC_BASE_URL` in your `.env` to match the tunnel URL.
 
-### 7. Test it
+### 8. Test it
 
 1. Call your Twilio number
 2. The agent should answer with personalized context
@@ -119,6 +123,7 @@ Update `PUBLIC_BASE_URL` in your `.env` to match the tunnel URL.
 4. Add a memory via the API:
    ```bash
    curl -X POST http://localhost:8000/api/memory/PHONE_HASH \
+     -H "Authorization: Bearer <your-admin-api-key>" \
      -H "Content-Type: application/json" \
      -d '{"fact": "Prefers to be called Mike"}'
    ```
@@ -166,15 +171,21 @@ Optional post-call webhook to log call completion.
 Returns `{"status": "ok"}`.
 
 ### `POST /api/memory/{phone_hash}`
-Add a long-term fact about a caller.
-```json
-{"fact": "Allergic to peanuts"}
+Add a long-term fact about a caller. Requires admin authentication.
+```bash
+curl -X POST http://localhost:8000/api/memory/PHONE_HASH \
+  -H "Authorization: Bearer <key>" \
+  -H "Content-Type: application/json" \
+  -d '{"fact": "Allergic to peanuts"}'
 ```
 
 ### `POST /api/notes`
-Add a daily context note (global or caller-specific).
-```json
-{"note": "Office closed today for holiday", "phone_hash": null}
+Add a daily context note (global or caller-specific). Requires admin authentication.
+```bash
+curl -X POST http://localhost:8000/api/notes \
+  -H "Authorization: Bearer <key>" \
+  -H "Content-Type: application/json" \
+  -d '{"note": "Office closed today for holiday", "phone_hash": null}'
 ```
 
 ## Project Structure
@@ -203,6 +214,8 @@ elevenlabs-twilio-memory-bridge/
 - **HTTPS only** — both OpenClaw and the bridge should be behind TLS in production
 - **Webhook verification** — set `WEBHOOK_SECRET` and configure it in ElevenLabs settings
 - **No secrets in source** — all configurable values come from environment variables
+- **Admin endpoint authentication** — set `ADMIN_API_KEY` to protect the `/api/memory/{phone_hash}` and `/api/notes` endpoints with Bearer token authentication. Admin endpoints are disabled if this key is not configured.
+- **CORS configuration** — CORS is disabled by default. Set `ALLOWED_ORIGINS` to a comma-separated list of origins if your deployment requires cross-origin browser access.
 
 ## Deployment Options
 
