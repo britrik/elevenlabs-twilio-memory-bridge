@@ -322,7 +322,7 @@ class TestAuthEdgeCases:
         # `if not ADMIN_API_KEY` which checks truthiness of the raw string.
         # "   " is truthy, so it's treated as configured — auth should work
         # against that whitespace key. Sending a non-matching token → 401.
-        client, key = configured_client_factory("   ")
+        client, _ = configured_client_factory("   ")
         resp = client.post(
             "/api/notes",
             json={"note": "test"},
@@ -332,7 +332,7 @@ class TestAuthEdgeCases:
 
     def test_whitespace_key_exact_match_accepted(self, configured_client_factory):
         """If ADMIN_API_KEY is whitespace, sending that exact whitespace should succeed."""
-        client, key = configured_client_factory("   ")
+        client, _ = configured_client_factory("   ")
         resp = client.post(
             "/api/notes",
             json={"note": "test"},

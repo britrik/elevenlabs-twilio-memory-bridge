@@ -13,17 +13,11 @@ configurations we:
 
 from __future__ import annotations
 
-import tempfile
-from pathlib import Path
-
 import hypothesis.strategies as st
 from hypothesis import given, settings, HealthCheck
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
-
-import app as app_module
-import memory as memory_module
 
 
 # ── Strategies ──────────────────────────────────────────────────────────────
@@ -57,19 +51,20 @@ endpoint_strategy = st.sampled_from([
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 
-def _build_cors_app(origins: list[str]) -> FastAPI:
-    """Create a fresh FastAPI app with CORS middleware configured for the given origins.
+def _build_cors_app(origins: list[str] | None = None) -> FastAPI:
+    """Create a fresh FastAPI app, optionally with CORS middleware.
 
     Mounts a minimal /health endpoint so we have something to hit.
     """
     test_app = FastAPI()
-    test_app.add_middleware(
-        CORSMiddleware,
-        allow_origins=origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    if origins:
+        test_app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
 
     @test_app.get("/health")
     async def health():
@@ -88,24 +83,20 @@ def _build_cors_app(origins: list[str]) -> FastAPI:
 )
 @settings(max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture])
 def test_cors_headers_absent_when_unconfigured(
-    request_origin, endpoint, monkeypatch
+    request_origin, endpoint
 ):
     """P4: For any request with any Origin header, when ALLOWED_ORIGINS is not
     configured, the response SHALL NOT contain Access-Control-Allow-Origin."""
-    with tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setattr(memory_module, "DATA_DIR", Path(tmp))
-        # Ensure ALLOWED_ORIGINS is empty (default — no CORS middleware)
-        monkeypatch.setattr(app_module, "ALLOWED_ORIGINS", "")
+    test_app = _build_cors_app()
+    client = TestClient(test_app, raise_server_exceptions=False)
+    method, path = endpoint
+    resp = client.request(method, path, headers={"Origin": request_origin})
 
-        client = TestClient(app_module.app, raise_server_exceptions=False)
-        method, path = endpoint
-        resp = client.request(method, path, headers={"Origin": request_origin})
-
-        assert "access-control-allow-origin" not in resp.headers, (
-            f"Expected no CORS header for unconfigured ALLOWED_ORIGINS, "
-            f"but got Access-Control-Allow-Origin: {resp.headers.get('access-control-allow-origin')} "
-            f"for Origin: {request_origin}"
-        )
+    assert "access-control-allow-origin" not in resp.headers, (
+        f"Expected no CORS header for unconfigured ALLOWED_ORIGINS, "
+        f"but got Access-Control-Allow-Origin: {resp.headers.get('access-control-allow-origin')} "
+        f"for Origin: {request_origin}"
+    )
 
 
 @given(
@@ -113,28 +104,25 @@ def test_cors_headers_absent_when_unconfigured(
 )
 @settings(max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture])
 def test_cors_preflight_absent_when_unconfigured(
-    request_origin, monkeypatch
+    request_origin
 ):
     """P4 (preflight): OPTIONS preflight requests should also lack CORS headers
     when ALLOWED_ORIGINS is not configured."""
-    with tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setattr(memory_module, "DATA_DIR", Path(tmp))
-        monkeypatch.setattr(app_module, "ALLOWED_ORIGINS", "")
+    test_app = _build_cors_app()
+    client = TestClient(test_app, raise_server_exceptions=False)
+    resp = client.options(
+        "/health",
+        headers={
+            "Origin": request_origin,
+            "Access-Control-Request-Method": "GET",
+        },
+    )
 
-        client = TestClient(app_module.app, raise_server_exceptions=False)
-        resp = client.options(
-            "/health",
-            headers={
-                "Origin": request_origin,
-                "Access-Control-Request-Method": "GET",
-            },
-        )
-
-        assert "access-control-allow-origin" not in resp.headers, (
-            f"Expected no CORS header on preflight for unconfigured ALLOWED_ORIGINS, "
-            f"but got Access-Control-Allow-Origin: {resp.headers.get('access-control-allow-origin')} "
-            f"for Origin: {request_origin}"
-        )
+    assert "access-control-allow-origin" not in resp.headers, (
+        f"Expected no CORS header on preflight for unconfigured ALLOWED_ORIGINS, "
+        f"but got Access-Control-Allow-Origin: {resp.headers.get('access-control-allow-origin')} "
+        f"for Origin: {request_origin}"
+    )
 
 
 # ── Property 5: CORS allows only configured origins ────────────────────────
@@ -147,7 +135,7 @@ def test_cors_preflight_absent_when_unconfigured(
 )
 @settings(max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture])
 def test_cors_allows_only_configured_origins(
-    allowed_origins, request_origin, monkeypatch
+    allowed_origins, request_origin
 ):
     """P5: For any configured origins list and any Origin header, the response
     SHALL include Access-Control-Allow-Origin only if the origin is in the list."""
@@ -176,7 +164,7 @@ def test_cors_allows_only_configured_origins(
 )
 @settings(max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture])
 def test_cors_preflight_allows_only_configured_origins(
-    allowed_origins, request_origin, monkeypatch
+    allowed_origins, request_origin
 ):
     """P5 (preflight): OPTIONS preflight should also respect the configured origins list."""
     test_app = _build_cors_app(allowed_origins)

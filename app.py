@@ -300,7 +300,7 @@ async def verify_admin_api_key(
             status_code=401,
             detail="Invalid Authorization header format. Use: Authorization: Bearer <key>",
         )
-    if token != ADMIN_API_KEY:
+    if not hmac.compare_digest(token, ADMIN_API_KEY):
         raise HTTPException(
             status_code=401,
             detail="Invalid API key.",
@@ -345,13 +345,18 @@ app = FastAPI(
 
 if ALLOWED_ORIGINS:
     _origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=_origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    if _origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=_origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+    else:
+        logger.warning(
+            "ALLOWED_ORIGINS was set but no valid origins were parsed; CORS disabled."
+        )
 
 
 # ── Endpoints ───────────────────────────────────────────────────────────────
