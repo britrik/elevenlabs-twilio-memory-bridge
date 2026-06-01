@@ -1,10 +1,62 @@
 ---
 name: elevenlabs-twilio-memory-bridge
+description: "FastAPI personalization webhook that adds persistent caller memory and dynamic context injection to ElevenLabs Conversational AI agents on Twilio. No audio proxying, file-based persistence, OpenClaw compatible."
 version: "1.1.0"
 author: britrik
-description: "FastAPI personalization webhook that adds persistent caller memory and dynamic context injection to ElevenLabs Conversational AI agents on Twilio. No audio proxying, file-based persistence, OpenClaw compatible."
 tags: ["elevenlabs", "twilio", "voice-agent", "telephony", "conversational-ai", "memory-injection", "fastapi"]
-emoji: ":telephone_receiver:"
+metadata:
+  openclaw:
+    requires:
+      env:
+        - ELEVENLABS_API_KEY
+        - ELEVENLABS_AGENT_ID
+        - OPENCLAW_API_BASE_URL
+        - PUBLIC_BASE_URL
+        - ADMIN_API_KEY
+      bins:
+        - python3
+        - pip
+        - uvicorn
+    primaryEnv: ELEVENLABS_API_KEY
+    envVars:
+      - name: ELEVENLABS_API_KEY
+        required: true
+        description: Scoped ElevenLabs API key for agent access.
+      - name: ELEVENLABS_AGENT_ID
+        required: true
+        description: ElevenLabs Conversational AI Agent ID.
+      - name: OPENCLAW_API_BASE_URL
+        required: true
+        description: Base URL of your OpenClaw instance (HTTPS).
+      - name: PUBLIC_BASE_URL
+        required: true
+        description: Publicly reachable URL of this bridge service.
+      - name: ADMIN_API_KEY
+        required: true
+        description: Secret key for admin endpoint authentication (Bearer token).
+      - name: WEBHOOK_SECRET
+        required: false
+        description: Shared secret for webhook HMAC verification.
+      - name: SOUL_TEMPLATE_PATH
+        required: false
+        description: Path to personality template file (default ./soul_template.md).
+      - name: DATA_DIR
+        required: false
+        description: Directory for JSON persistence (default ./data).
+      - name: ALLOWED_ORIGINS
+        required: false
+        description: Comma-separated CORS origins (leave unset to disable CORS).
+      - name: HOST
+        required: false
+        description: Bind address for uvicorn (default 0.0.0.0).
+      - name: PORT
+        required: false
+        description: Listen port (default 8000).
+      - name: LOG_LEVEL
+        required: false
+        description: Python logging level (default INFO).
+    emoji: "\U0001F4DE"
+    homepage: https://github.com/britrik/elevenlabs-twilio-memory-bridge
 ---
 
 # elevenlabs-twilio-memory-bridge
@@ -17,10 +69,10 @@ When a call arrives on your Twilio number, ElevenLabs' native integration trigge
 
 ## Architecture
 
-- **No audio proxying** - ElevenLabs and Twilio handle media directly
-- **Webhook only** - called once per inbound call to inject context
-- **File-based persistence** - JSON files in `./data/`, zero external dependencies
-- **OpenClaw compatible** - works with any OpenAI-compatible LLM endpoint
+- **No audio proxying** — ElevenLabs and Twilio handle media directly
+- **Webhook only** — called once per inbound call to inject context
+- **File-based persistence** — JSON files in `./data/`, zero external dependencies
+- **OpenClaw compatible** — works with any OpenAI-compatible LLM endpoint
 
 ## Endpoints
 
@@ -42,70 +94,29 @@ When a call arrives on your Twilio number, ElevenLabs' native integration trigge
 6. Import Twilio number in ElevenLabs dashboard
 7. Run: `uvicorn app:app --host 0.0.0.0 --port 8000`
 
-## Soul Template
-
-The included `soul_template.md` is a safe generic example containing no personally identifiable information. However, soul templates can contain sensitive personal details depending on how they are customized.
-
-**Before deploying to production**, review and customize `soul_template.md` to match your agent's personality and use case. Ensure no private or sensitive information is embedded in the template unless you have appropriate access controls in place.
-
-## Data Storage (DATA_DIR)
-
-The service persists data as JSON files in a local directory.
-
-- **Configuration**: Set the `DATA_DIR` environment variable to specify the storage directory.
-- **Default value**: `./data/`
-- **Stored data types**: Caller memory facts (per phone hash), context notes (global and caller-scoped), and session history.
-
-### Filesystem Permissions
-
-Restrict access to the `DATA_DIR` directory so only the service process user can read and write:
-
-```bash
-chmod 700 /path/to/data
-```
-
-Avoid running the service as root. Use a dedicated service account with minimal privileges.
-
-### Encryption at Rest
-
-The JSON files are stored unencrypted by default. If your deployment handles sensitive caller data, consider:
-
-- Placing `DATA_DIR` on an encrypted filesystem (e.g., LUKS, dm-crypt, or cloud-provider volume encryption)
-- Using a cloud storage backend with server-side encryption enabled
-
-### Retention and Erasure
-
-There is no automatic data retention or expiration policy built in. Operators should:
-
-- Define a retention period appropriate for their use case and jurisdiction
-- Implement a periodic cleanup process to delete stale data from `DATA_DIR`
-- Support data erasure requests by deleting the relevant phone hash JSON files
-
 ## Required Environment Variables
 
-- `ELEVENLABS_API_KEY` - scoped ElevenLabs key
-- `ELEVENLABS_AGENT_ID` - your agent ID
-- `OPENCLAW_API_BASE_URL` - your OpenClaw instance URL
-- `PUBLIC_BASE_URL` - publicly reachable URL of this service
-- `ADMIN_API_KEY` - secret key for authenticating requests to admin endpoints (`/api/memory/{phone_hash}`, `/api/notes`). Required for admin access.
+- `ELEVENLABS_API_KEY` — scoped ElevenLabs key
+- `ELEVENLABS_AGENT_ID` — your agent ID
+- `OPENCLAW_API_BASE_URL` — your OpenClaw instance URL
+- `PUBLIC_BASE_URL` — publicly reachable URL of this service
+- `ADMIN_API_KEY` — secret for admin endpoint auth
 
 ## Optional Environment Variables
 
-- `ALLOWED_ORIGINS` - comma-separated list of allowed CORS origins. When not set, CORS is disabled (appropriate for webhook-only deployments). Example: `https://dashboard.example.com,https://admin.example.com`
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `WEBHOOK_SECRET` | _(unset)_ | Shared secret for HMAC webhook verification |
+| `SOUL_TEMPLATE_PATH` | `./soul_template.md` | Path to personality template file |
+| `DATA_DIR` | `./data` | Directory for JSON persistence |
+| `ALLOWED_ORIGINS` | _(unset)_ | Comma-separated CORS origins |
+| `HOST` | `0.0.0.0` | Bind address for uvicorn |
+| `PORT` | `8000` | Listen port |
+| `LOG_LEVEL` | `INFO` | Python logging level |
 
 ## Security
 
 - All caller phone numbers are SHA-256 hashed before storage/logging
 - Secrets loaded exclusively from environment variables
-- Optional HMAC webhook signature verification (configure `WEBHOOK_SECRET`)
+- Optional HMAC webhook signature verification
 - Safe for public GitHub repos, no secrets in source
-
-### Admin Endpoint Authentication
-
-The admin endpoints (`/api/memory/{phone_hash}` and `/api/notes`) require authentication via the `ADMIN_API_KEY` environment variable. Requests must include an `Authorization: Bearer <key>` header.
-
-- If `ADMIN_API_KEY` is configured and the request provides a valid Bearer token, the request is processed normally.
-- If `ADMIN_API_KEY` is configured but the Authorization header is missing or invalid, the request is rejected with HTTP 401.
-- If `ADMIN_API_KEY` is not configured, all admin endpoint requests are rejected with HTTP 403.
-
-Webhook endpoints (`/webhook/personalize`, `/webhook/post-call`) and the `/health` endpoint do not require admin authentication.
