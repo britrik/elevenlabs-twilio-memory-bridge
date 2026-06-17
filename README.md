@@ -259,3 +259,7 @@ This skill is available on [ClawHub](https://clawhub.com). To install:
 ## License
 
 MIT
+
+## Download History
+
+[![Download History](https://skill-history.com/chart/britrik/elevenlabs-twilio-memory-bridge.svg)](https://skill-history.com/britrik/elevenlabs-twilio-memory-bridge)
