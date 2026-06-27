@@ -331,19 +331,26 @@ async def verify_admin_api_key(
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Application lifespan: startup / shutdown hooks."""
     global _soul_template  # noqa: PLW0603
+
+    # ── Fail-fast validation for required secrets ───────────────────────────
+    if not PHONE_HASH_SALT:
+        raise RuntimeError(
+            "PHONE_HASH_SALT is not configured. Generate one with: "
+            "openssl rand -base64 32"
+        )
+    if not WEBHOOK_SECRET:
+        raise RuntimeError(
+            "WEBHOOK_SECRET is not configured. Set a shared secret and "
+            "configure the same value in ElevenLabs webhook settings."
+        )
+
     ensure_data_dir()
     _soul_template = _load_soul_template()
 
     logger.info("Bridge starting — agent_id=%s", ELEVENLABS_AGENT_ID or "(not set)")
     logger.info("Public URL: %s", PUBLIC_BASE_URL or "(not set)")
     logger.info("Data dir:   %s", Path(DATA_DIR).resolve())
-    if not WEBHOOK_SECRET:
-        logger.warning(
-            "WEBHOOK_SECRET is not configured — webhook signature verification is DISABLED. "
-            "Set WEBHOOK_SECRET and configure the same secret in ElevenLabs to verify HMAC signatures."
-        )
-    else:
-        logger.info("Webhook signature verification is enabled.")
+    logger.info("Webhook signature verification: enabled")
     yield
     logger.info("Bridge shutting down")
 
