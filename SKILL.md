@@ -39,7 +39,7 @@ metadata:
         description: Shared secret for webhook HMAC verification. Must be set in production.
       - name: PHONE_HASH_SALT
         required: true
-        description: Salt for bcrypt phone number hashing. Generate with openssl rand -base64 32.
+        description: Salt for HMAC-SHA256 phone number hashing. Generate with openssl rand -base64 32.
       - name: DATA_ENCRYPTION_KEY
         required: false
         description: Fernet key for encrypting memories and notes at rest. When unset, data is stored as plain JSON.
@@ -107,14 +107,14 @@ When a call arrives on your Twilio number, ElevenLabs' native integration trigge
 - `OPENCLAW_API_BASE_URL` — your OpenClaw instance URL
 - `PUBLIC_BASE_URL` — publicly reachable URL of this service
 - `ADMIN_API_KEY` — secret for admin endpoint auth
+- `PHONE_HASH_SALT` — salt for phone number hashing. Generate with `openssl rand -base64 32`. Changing this invalidates all existing caller data.
+- `WEBHOOK_SECRET` — shared secret for HMAC webhook verification. Must be set in production.
 
 ## Optional Environment Variables
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `PHONE_HASH_SALT` | _(unset)_ | **Required.** Salt for bcrypt phone number hashing. Generate with `openssl rand -base64 32`. Changing this invalidates all existing caller data. |
 | `DATA_ENCRYPTION_KEY` | _(unset)_ | Fernet key for encrypting memories and notes at rest. Generate with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. When unset, data is stored as plain JSON. |
-| `WEBHOOK_SECRET` | _(unset)_ | **Required.** Shared secret for HMAC webhook verification. |
 | `SOUL_TEMPLATE_PATH` | `./soul_template.md` | Path to personality template file |
 | `DATA_DIR` | `./data` | Directory for JSON persistence |
 | `ALLOWED_ORIGINS` | _(unset)_ | Comma-separated CORS origins |
@@ -124,11 +124,10 @@ When a call arrives on your Twilio number, ElevenLabs' native integration trigge
 
 ## Security
 
-- **bcrypt phone hashing** — Phone numbers are hashed with bcrypt (salted, slow) before storage. The salt is set via `PHONE_HASH_SALT` env var. Changing the salt invalidates existing caller data.
+- **Deterministic phone hashing** — Phone numbers are hashed with HMAC-SHA256 using `PHONE_HASH_SALT` as the key before storage. Changing the salt invalidates existing caller data.
 - **Encryption at rest** — Memories and notes are encrypted with Fernet when `DATA_ENCRYPTION_KEY` is set. Data is stored as plain JSON when the key is not configured.
 - **Mandatory webhook verification** — `WEBHOOK_SECRET` is required in production. Webhooks are rejected when the secret is not set (fail-closed).
 - **Rate limiting** — Admin endpoints (`/api/memory`, `/api/notes`) are limited to 30 requests per minute. Webhook endpoints are limited to 60 per minute.
-- **Input sanitization** — Memory facts and notes are HTML-escaped before storage to prevent XSS.
 - **File locking** — JSON reads and writes use POSIX advisory locks (`fcntl`) to prevent race conditions under concurrent access.
 - **Restrictive permissions** — Data directory (`DATA_DIR`) is created with `0o700` permissions. JSON files are written with `0o600`.
 - **Secrets from env vars only** — No hardcoded credentials in source.
@@ -138,9 +137,7 @@ When a call arrives on your Twilio number, ElevenLabs' native integration trigge
 
 v1.2.0 introduces **breaking security changes**:
 
-1. **PHONE_HASH_SALT is now required** — Previously, phone numbers were hashed with unsalted SHA-256. Now bcrypt with a salt is required. **Existing caller data will be unreachable** after upgrading because the hash keys change. You must either:
-   - Accept data loss and start fresh, or
-   - Run the provided migration script to re-hash existing data with the new algorithm.
+1. **PHONE_HASH_SALT is now required** — Previously, phone numbers were hashed with unsalted SHA-256. Now HMAC-SHA256 with a salt is required. **Existing caller data will be unreachable** after upgrading because the hash keys change. You must accept data loss and start fresh (v1.2.0 uses a different hashing algorithm).
 
 2. **WEBHOOK_SECRET is now required** — Previously optional for development. Now mandatory in all environments. Webhooks without a valid secret are rejected.
 
@@ -149,7 +146,9 @@ v1.2.0 introduces **breaking security changes**:
 ### Migration checklist
 
 1. Generate a salt: `openssl rand -base64 32`
-2. Generate an encryption key: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
-3. Add both to `.env`
-4. Review CORS settings — `ALLOWED_ORIGINS` now defaults to disabled
-5. Update ElevenLabs webhook settings with the new `WEBHOOK_SECRET`
+2. Generate a webhook secret: `openssl rand -hex 32`
+3. Generate an encryption key (optional): `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
+4. Add all to `.env`
+5. Review CORS settings — `ALLOWED_ORIGINS` now defaults to disabled
+6. Update ElevenLabs webhook settings with the new `WEBHOOK_SECRET`
+7. Note: v1.2.0 requires fresh data — existing caller sessions will be recreated on first call

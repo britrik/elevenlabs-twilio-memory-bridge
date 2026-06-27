@@ -18,10 +18,8 @@ Architecture
 
 from __future__ import annotations
 
-import bcrypt
 import hashlib
 import hmac
-import html
 import logging
 import os
 import re
@@ -165,19 +163,21 @@ def normalize_phone(raw: str) -> str:
 
 
 def hash_phone(phone: str) -> str:
-    """Return a bcrypt hash of a phone number string with salt.
+    """Return a deterministic HMAC-SHA256 hash of a phone number.
 
-    Uses bcrypt with a per-installation salt for slow, salted hashing.
-    Falls back to SHA-256 only for reading legacy data.
+    Uses PHONE_HASH_SALT as the HMAC key so the same phone always
+    produces the same hash, enabling reliable session lookups.
     """
     if not PHONE_HASH_SALT:
         raise RuntimeError(
             "PHONE_HASH_SALT is not configured. Set a strong salt "
             "(e.g. openssl rand -base64 32) in your environment."
         )
-    # Combine the per-installation salt with the phone number
-    salted = f"{PHONE_HASH_SALT}:{phone}"
-    return bcrypt.hashpw(salted.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode()
+    return hmac.new(
+        PHONE_HASH_SALT.encode("utf-8"),
+        phone.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def verify_webhook_signature(
@@ -441,6 +441,9 @@ async def personalize(
         )
         return response
 
+    except RuntimeError:
+        # Configuration errors (e.g. missing PHONE_HASH_SALT) must propagate
+        raise
     except Exception as exc:
         logger.warning("Error building personalization — returning fallback: %s", type(exc).__name__)
         return _fallback_personalization_response()
@@ -485,25 +488,21 @@ async def post_call(
 
 @app.post("/api/memory/{phone_hash}", dependencies=[Depends(verify_admin_api_key)])
 @limiter.limit("30/minute")
-async def api_add_memory(phone_hash: str, body: AddMemoryRequest) -> dict:
+async def api_add_memory(request: Request, phone_hash: str, body: AddMemoryRequest) -> dict:
     """Add a long-term memory fact for a caller identified by phone hash."""
-    # Sanitize input to prevent XSS if data is ever rendered
-    sanitized_fact = html.escape(body.fact)
-    facts = add_memory(phone_hash, sanitized_fact)
+    facts = add_memory(phone_hash, body.fact)
     return {"status": "ok", "phone_hash": phone_hash, "total_facts": len(facts)}
 
 
 @app.post("/api/notes", dependencies=[Depends(verify_admin_api_key)])
 @limiter.limit("30/minute")
-async def api_add_note(body: AddNoteRequest) -> dict:
+async def api_add_note(request: Request, body: AddNoteRequest) -> dict:
     """Add a daily or global context note.
 
     If ``phone_hash`` is provided the note is scoped to that caller;
     otherwise it is visible to all callers.
     """
-    # Sanitize input to prevent XSS if data is ever rendered
-    sanitized_note = html.escape(body.note)
-    entry = add_note(sanitized_note, body.phone_hash)
+    entry = add_note(body.note, body.phone_hash)
     return {
         "status": "ok",
         "timestamp": entry["timestamp"],

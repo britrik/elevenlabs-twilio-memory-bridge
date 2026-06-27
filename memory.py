@@ -97,22 +97,29 @@ def _read_json(path: Path) -> dict | list:
 
 
 def _write_json(path: Path, data: dict | list) -> None:
-    """Atomically write *data* as JSON to *path*."""
+    """Atomically write *data* as JSON to *path*.
+
+    Locks the target file (not the temp) so concurrent writers serialize
+    on the same lock target during the full read-modify-write cycle.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Ensure the target file exists so we can lock it
+    path.touch(exist_ok=True)
     tmp = path.with_suffix(".tmp")
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            # Acquire exclusive lock for writing
-            fcntl.flock(f, fcntl.LOCK_EX)
+        with open(path, "a+", encoding="utf-8") as lockf:
+            # Acquire exclusive lock on the target file
+            fcntl.flock(lockf, fcntl.LOCK_EX)
             try:
-                f.write(json.dumps(data, indent=2))
-                f.flush()
-                os.fsync(f.fileno())
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(json.dumps(data, indent=2))
+                    f.flush()
+                    os.fsync(f.fileno())
+                tmp.replace(path)
+                # Set restrictive permissions on the written file
+                os.chmod(path, 0o600)
             finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
-        tmp.replace(path)
-        # Set restrictive permissions on the written file
-        os.chmod(path, 0o600)
+                fcntl.flock(lockf, fcntl.LOCK_UN)
     except OSError as exc:
         logger.warning("Failed to write %s: %s", path, exc)
 
@@ -125,7 +132,7 @@ def ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     # Set restrictive permissions: owner read/write/execute only
     os.chmod(DATA_DIR, 0o700)
-    logger.warning("Data directory ready: %s", DATA_DIR.resolve())
+    logger.info("Data directory ready: %s", DATA_DIR.resolve())
 
 
 def _encrypt(data: str) -> str:
@@ -141,9 +148,9 @@ def _decrypt(data: str) -> str:
         return data
     try:
         return _fernet.decrypt(data.encode("utf-8")).decode("utf-8")
-    except Exception as exc:
-        logger.warning("Failed to decrypt data: %s — returning as-is", exc)
-        return data
+    except Exception:
+        logger.error("Failed to decrypt data — key mismatch or corruption")
+        return "[DECRYPTION_FAILED]"
 
 
 def load_session(phone_hash: str) -> Session:
@@ -222,7 +229,7 @@ def add_memory(phone_hash: str, fact: str) -> list[str]:
     stored_fact = _encrypt(fact) if _fernet else fact
     memories[phone_hash].setdefault("facts", []).append(stored_fact)
     _write_json(_memories_path(), memories)
-    logger.warning("Stored fact for %s (total: %d)", phone_hash[:8], len(memories[phone_hash]["facts"]))
+    logger.info("Stored fact for %s (total: %d)", phone_hash[:8], len(memories[phone_hash]["facts"]))
     return memories[phone_hash]["facts"]
 
 
@@ -257,7 +264,7 @@ def add_note(note: str, phone_hash: str | None = None) -> Note:
     entry = Note(timestamp=time.time(), note=stored_note, phone_hash=phone_hash)
     all_notes.append(entry)
     _write_json(_notes_path(), all_notes)
-    logger.warning("Added note (global=%s)", phone_hash is None)
+    logger.info("Added note (global=%s)", phone_hash is None)
     # Return decrypted version for display
     if _fernet:
         entry["note"] = note
