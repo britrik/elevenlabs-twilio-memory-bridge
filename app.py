@@ -18,8 +18,10 @@ Architecture
 
 from __future__ import annotations
 
+import bcrypt
 import hashlib
 import hmac
+import html
 import logging
 import os
 import re
@@ -34,6 +36,9 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from memory import (
     Session,
@@ -56,6 +61,8 @@ OPENCLAW_API_BASE_URL: str = os.getenv("OPENCLAW_API_BASE_URL", "")
 PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "")
 WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "")
 ADMIN_API_KEY: str = os.getenv("ADMIN_API_KEY", "")
+PHONE_HASH_SALT: str = os.getenv("PHONE_HASH_SALT", "")
+DATA_ENCRYPTION_KEY: str = os.getenv("DATA_ENCRYPTION_KEY", "")
 ALLOWED_ORIGINS: str = os.getenv("ALLOWED_ORIGINS", "")
 SOUL_TEMPLATE_PATH: str = os.getenv("SOUL_TEMPLATE_PATH", "./soul_template.md")
 DATA_DIR: str = os.getenv("DATA_DIR", "./data")
@@ -158,8 +165,19 @@ def normalize_phone(raw: str) -> str:
 
 
 def hash_phone(phone: str) -> str:
-    """Return a hex SHA-256 hash of a phone number string."""
-    return hashlib.sha256(phone.encode("utf-8")).hexdigest()
+    """Return a bcrypt hash of a phone number string with salt.
+
+    Uses bcrypt with a per-installation salt for slow, salted hashing.
+    Falls back to SHA-256 only for reading legacy data.
+    """
+    if not PHONE_HASH_SALT:
+        raise RuntimeError(
+            "PHONE_HASH_SALT is not configured. Set a strong salt "
+            "(e.g. openssl rand -base64 32) in your environment."
+        )
+    # Combine the per-installation salt with the phone number
+    salted = f"{PHONE_HASH_SALT}:{phone}"
+    return bcrypt.hashpw(salted.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode()
 
 
 def verify_webhook_signature(
@@ -168,12 +186,11 @@ def verify_webhook_signature(
 ) -> bool:
     """Verify the HMAC-SHA256 signature from ElevenLabs.
 
-    Returns ``True`` if the secret is unset (development mode) or if the
-    signature matches.
+    Returns ``False`` if the secret is not configured (fail-closed).
     """
     if not WEBHOOK_SECRET:
-        logger.debug("WEBHOOK_SECRET not configured — skipping signature check")
-        return True
+        logger.warning("WEBHOOK_SECRET is not configured — rejecting request (fail-closed)")
+        return False
     if not signature:
         return False
     expected = hmac.new(
@@ -331,17 +348,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("Bridge shutting down")
 
 
+# ── Rate limiting ───────────────────────────────────────────────────────────
+
+limiter = Limiter(key_func=get_remote_address)
+
 # ── App ─────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="ElevenLabs–Twilio Memory Bridge",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "Personalization webhook for ElevenLabs' native Twilio integration. "
         "Injects caller memory and personality into each conversation."
     ),
     lifespan=lifespan,
 )
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 if ALLOWED_ORIGINS:
     _origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
@@ -350,13 +373,11 @@ if ALLOWED_ORIGINS:
             CORSMiddleware,
             allow_origins=_origins,
             allow_credentials=True,
-            allow_methods=["*"],
-            allow_headers=["*"],
+            allow_methods=["GET", "POST"],
+            allow_headers=["Authorization", "Content-Type", "X-Webhook-Secret"],
         )
     else:
-        logger.warning(
-            "ALLOWED_ORIGINS was set but no valid origins were parsed; CORS disabled."
-        )
+        logger.warning("ALLOWED_ORIGINS was set but no valid origins were parsed; CORS disabled.")
 
 
 # ── Endpoints ───────────────────────────────────────────────────────────────
@@ -367,12 +388,12 @@ async def health() -> dict[str, str]:
     """Health-check endpoint."""
     return {
         "status": "ok",
-        "agent_id": ELEVENLABS_AGENT_ID or "not_configured",
         "timestamp": datetime.now(tz=timezone.utc).isoformat(),
     }
 
 
 @app.post("/webhook/personalize")
+@limiter.limit("60/minute")
 async def personalize(
     request: Request,
     x_webhook_secret: str | None = Header(default=None),
@@ -391,8 +412,8 @@ async def personalize(
 
     try:
         payload = PersonalizeRequest.model_validate_json(body)
-    except Exception:
-        logger.exception("Failed to parse personalization payload")
+    except Exception as exc:
+        logger.warning("Failed to parse personalization payload: %s", type(exc).__name__)
         return _fallback_personalization_response()
 
     logger.info(
@@ -420,12 +441,13 @@ async def personalize(
         )
         return response
 
-    except Exception:
-        logger.exception("Error building personalization — returning fallback")
+    except Exception as exc:
+        logger.warning("Error building personalization — returning fallback: %s", type(exc).__name__)
         return _fallback_personalization_response()
 
 
 @app.post("/webhook/post-call")
+@limiter.limit("60/minute")
 async def post_call(
     request: Request,
     x_webhook_secret: str | None = Header(default=None),
@@ -442,8 +464,8 @@ async def post_call(
 
     try:
         payload = PostCallRequest.model_validate_json(body)
-    except Exception:
-        logger.exception("Failed to parse post-call payload")
+    except Exception as exc:
+        logger.warning("Failed to parse post-call payload: %s", type(exc).__name__)
         return {"status": "error", "detail": "Invalid payload"}
 
     phone = normalize_phone(payload.caller_id)
@@ -462,20 +484,26 @@ async def post_call(
 
 
 @app.post("/api/memory/{phone_hash}", dependencies=[Depends(verify_admin_api_key)])
+@limiter.limit("30/minute")
 async def api_add_memory(phone_hash: str, body: AddMemoryRequest) -> dict:
     """Add a long-term memory fact for a caller identified by phone hash."""
-    facts = add_memory(phone_hash, body.fact)
+    # Sanitize input to prevent XSS if data is ever rendered
+    sanitized_fact = html.escape(body.fact)
+    facts = add_memory(phone_hash, sanitized_fact)
     return {"status": "ok", "phone_hash": phone_hash, "total_facts": len(facts)}
 
 
 @app.post("/api/notes", dependencies=[Depends(verify_admin_api_key)])
+@limiter.limit("30/minute")
 async def api_add_note(body: AddNoteRequest) -> dict:
     """Add a daily or global context note.
 
     If ``phone_hash`` is provided the note is scoped to that caller;
     otherwise it is visible to all callers.
     """
-    entry = add_note(body.note, body.phone_hash)
+    # Sanitize input to prevent XSS if data is ever rendered
+    sanitized_note = html.escape(body.note)
+    entry = add_note(sanitized_note, body.phone_hash)
     return {
         "status": "ok",
         "timestamp": entry["timestamp"],
