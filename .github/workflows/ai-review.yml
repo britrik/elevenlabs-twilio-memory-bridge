@@ -20,8 +20,11 @@ jobs:
     if: github.event.pull_request != null && github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Build diff
-        run: git diff "origin/${{ github.base_ref }}...HEAD" -- '*.ts' '*.tsx' '*.js' '*.css' '*.json' '*.yml' '*.yaml' ':!package-lock.json' ':!dist/**' ':!*.min.js' > pr.diff
+        run: |
+          git diff "origin/${{ github.base_ref }}...HEAD" -- '*.ts' '*.tsx' '*.js' '*.css' '*.json' '*.yml' '*.yaml' ':!package-lock.json' ':!dist/**' ':!*.min.js' > pr.diff
       - name: Post AI review
         env:
           GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
@@ -32,24 +35,12 @@ jobs:
           python3 - <<'PY'
           import json, os, subprocess, sys, urllib.error, urllib.request
           diff = open('pr.diff', encoding='utf-8').read().strip()
-          if not diff:
-              print('No reviewable diff; skipping AI review.'); sys.exit(0)
-          key = os.environ.get('GLM_API_KEY', '').strip()
-          if not key:
-              print('Warning: GLM_API_KEY is not configured; skipping AI review.'); sys.exit(0)
-          prompt = f"Review this PR for privacy, security, correctness, and tests.\nPR: {os.environ['PR_TITLE']}\n```diff\n{diff[:36000]}\n```"
-          payload = json.dumps({'model': 'glm-5-turbo', 'messages': [{'role': 'user', 'content': prompt}], 'max_tokens': 4096, 'temperature': 0.2}).encode()
-          req = urllib.request.Request('https://api.z.ai/api/coding/paas/v4/chat/completions', data=payload, headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'})
+          if not diff or not os.environ.get('GLM_API_KEY', '').strip(): sys.exit(0)
+          prompt = f"Review this PR for privacy, security, correctness, and tests.\\nPR: {os.environ['PR_TITLE']}\\n```diff\\n{diff[:36000]}\\n```"
+          req = urllib.request.Request('https://api.z.ai/api/coding/paas/v4/chat/completions', data=json.dumps({'model':'glm-5-turbo','messages':[{'role':'user','content':prompt}],'max_tokens':4096,'temperature':0.2}).encode(), headers={'Authorization':f"Bearer {os.environ['GLM_API_KEY']}",'Content-Type':'application/json'})
           try:
-              with urllib.request.urlopen(req, timeout=60) as response:
-                  try: data = json.loads(response.read())
-                  except json.JSONDecodeError as exc: print(f'Warning: invalid GLM JSON ({exc}); skipping AI review.'); sys.exit(0)
-          except urllib.error.HTTPError as exc: print(f'Warning: GLM HTTP {exc.code} ({exc.reason}); skipping AI review.'); sys.exit(0)
-          except urllib.error.URLError as exc: print(f'Warning: GLM connection error ({exc.reason}); skipping AI review.'); sys.exit(0)
-          try:
-              choices = data.get('choices') or []
-              review = ((choices[0].get('message') or {}).get('content') or '').strip()
-          except (AttributeError, IndexError, TypeError) as exc: print(f'Warning: unusable GLM choices ({exc}); skipping AI review.'); sys.exit(0)
-          if not review: print('Warning: GLM returned no review content; skipping AI review.'); sys.exit(0)
-          subprocess.run(['gh', 'pr', 'comment', os.environ['PR_NUMBER'], '--body', review], check=True)
+              with urllib.request.urlopen(req, timeout=60) as response: data = json.loads(response.read())
+              review = ((data.get('choices') or [])[0].get('message') or {}).get('content', '').strip()
+          except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError, IndexError, AttributeError, TypeError): sys.exit(0)
+          if review: subprocess.run(['gh','pr','comment',os.environ['PR_NUMBER'],'--body',review], check=True)
           PY
