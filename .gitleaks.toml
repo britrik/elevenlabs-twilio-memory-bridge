@@ -1,0 +1,21 @@
+# Gitleaks config for britrik repos (oss-radar #9).
+# Extends the built-in ruleset; only allowlists things that can never hold a live secret.
+# A confirmed false positive in a specific commit goes in .gitleaksignore (by fingerprint), not here.
+title = "britrik gitleaks config"
+minVersion = "8.25.0"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Binary assets (never credentials). Lockfiles stay scanned: registry URLs in them can carry tokens."
+paths = [
+  '''\.(png|jpe?g|gif|webp|ico|bmp|woff2?|ttf|otf|eot|mp3|mp4|wav|pdf|zip)$''',
+]
+
+[[allowlists]]
+description = "Obvious placeholder values"
+regexTarget = "secret"
+regexes = [
+  '''(?i)^(your[-_ ]?(api[-_ ]?)?(key|token|secret)[-_a-z]*|replace[-_]?me|changeme|placeholder|example[-_a-z]*|dummy[-_a-z]*|x{8,}|\*{8,}|<[^>]+>)$''',
+]
