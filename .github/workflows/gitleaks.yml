@@ -1,0 +1,21 @@
+# Secret scanning with Gitleaks via britrik's shared workflow (oss-radar #9).
+name: Secret scan
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  schedule:
+    - cron: "17 5 * * 1"   # weekly full-history scan, Mondays 05:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gitleaks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gitleaks:
+    uses: britrik/shared-workflows/.github/workflows/gitleaks.yml@main
