@@ -13,8 +13,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: gitleaks-${{ github.ref }}
-  cancel-in-progress: true
+  # Only PR runs are superseded. Push, schedule and dispatch runs get their own
+  # group per commit, so no push range and no full-history scan is ever dropped.
+  group: gitleaks-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   gitleaks:
