@@ -8,17 +8,8 @@ minVersion = "8.25.0"
 useDefault = true
 
 [[allowlists]]
-description = "Lockfiles and binary assets (integrity hashes and blobs, never credentials)"
+description = "Binary assets (never credentials). Lockfiles stay scanned: registry URLs in them can carry tokens."
 paths = [
-  '''(^|/)package-lock\.json$''',
-  '''(^|/)npm-shrinkwrap\.json$''',
-  '''(^|/)pnpm-lock\.yaml$''',
-  '''(^|/)yarn\.lock$''',
-  '''(^|/)bun\.lockb?$''',
-  '''(^|/)poetry\.lock$''',
-  '''(^|/)uv\.lock$''',
-  '''(^|/)Cargo\.lock$''',
-  '''(^|/)Package\.resolved$''',
   '''\.(png|jpe?g|gif|webp|ico|bmp|woff2?|ttf|otf|eot|mp3|mp4|wav|pdf|zip)$''',
 ]
 
