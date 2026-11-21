@@ -175,7 +175,11 @@ def _encrypt_file_in_place(path: Path, encrypt_entries) -> int:
                 content = f.read()
             if not content.strip():
                 return 0
-            data = json.loads(content)
+            try:
+                data = json.loads(content)
+            except json.JSONDecodeError as exc:
+                logger.warning("Skipping encryption migration for unreadable %s: %s", path, exc)
+                return 0
             migrated = encrypt_entries(data)
             if migrated:
                 tmp = path.with_suffix(".tmp")

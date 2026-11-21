@@ -219,7 +219,7 @@ def sanitise_for_prompt(text: str, max_chars: int = _PROMPT_ITEM_MAX_CHARS) -> s
     flat = _CONTROL_CHARS.sub(" ", str(text))
     flat = flat.replace("<", "(").replace(">", ")")
     flat = re.sub(r"\s+", " ", flat).strip()
-    flat = flat.lstrip("#-*> ").replace("---", "-")
+    flat = re.sub(r"^(?:(?:#{1,6}|>|[-*])\s+)+", "", flat).replace("---", "-")
     if len(flat) > max_chars:
         flat = flat[: max_chars - 3].rstrip() + "..."
     return flat

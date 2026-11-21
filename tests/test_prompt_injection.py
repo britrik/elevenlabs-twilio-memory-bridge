@@ -116,3 +116,21 @@ def test_migration_failure_is_not_swallowed(tmp_path, monkeypatch):
     with pytest.raises(OSError):
         memory_module.encrypt_plaintext_entries()
     assert "likes jazz" in (tmp_path / "memories.json").read_text()
+
+
+def test_sanitise_keeps_meaningful_leading_characters():
+    assert app_module.sanitise_for_prompt("-5 degrees is too cold") == "-5 degrees is too cold"
+    assert app_module.sanitise_for_prompt("## Heading text") == "Heading text"
+    assert app_module.sanitise_for_prompt("* - list item") == "list item"
+
+
+def test_migration_skips_corrupt_files(tmp_path, monkeypatch):
+    from cryptography.fernet import Fernet
+
+    import memory as memory_module
+
+    monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(memory_module, "_fernet", Fernet(Fernet.generate_key()))
+    (tmp_path / "memories.json").write_text("{not json")
+    assert memory_module.encrypt_plaintext_entries() == 0
+    assert (tmp_path / "memories.json").read_text() == "{not json"
