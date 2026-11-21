@@ -226,7 +226,7 @@ elevenlabs-twilio-memory-bridge/
 - **Phone number hashing** — caller IDs are hashed with HMAC-SHA256 using a per-installation secret (`PHONE_HASH_SALT`). The same input always produces the same hash, enabling reliable session lookups while preventing reversal without the secret.
 - **Mandatory webhook verification** — `WEBHOOK_SECRET` is required. Webhooks are rejected with 401 if the secret is not configured (fail-closed).
 - **Rate limiting** — webhook endpoints limited to 60 requests/minute, admin endpoints to 30 requests/minute per IP.
-- **Encryption at rest** — memories and notes are encrypted with Fernet when `DATA_ENCRYPTION_KEY` is set. Data is stored as plain JSON when the key is not configured.
+- **Encryption at rest** — memories and notes are encrypted with Fernet. Startup fails without `DATA_ENCRYPTION_KEY` unless you explicitly set `ALLOW_PLAINTEXT_STORAGE=true`.
 - **File permissions** — data directory created with `0o700`, JSON files written with `0o600`.
 - **File locking** — POSIX advisory locks (`fcntl`) prevent race conditions on concurrent reads/writes.
 - **Startup validation** — the app refuses to start if `PHONE_HASH_SALT` or `WEBHOOK_SECRET` are not set.
