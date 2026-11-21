@@ -142,15 +142,53 @@ def _encrypt(data: str) -> str:
     return _fernet.encrypt(data.encode("utf-8")).decode("utf-8")
 
 
+_FERNET_TOKEN_PREFIX = "gAAAAA"
+
+
 def _decrypt(data: str) -> str:
     """Decrypt *data* with Fernet if a key is configured."""
     if not _fernet:
+        return data
+    if not data.startswith(_FERNET_TOKEN_PREFIX):
+        # Written before encryption was enabled; Fernet tokens always carry this prefix.
         return data
     try:
         return _fernet.decrypt(data.encode("utf-8")).decode("utf-8")
     except Exception:
         logger.error("Failed to decrypt data — key mismatch or corruption")
         return "[DECRYPTION_FAILED]"
+
+
+def encrypt_plaintext_entries() -> int:
+    """Encrypt facts and notes that were written before encryption was enabled.
+
+    Runs at startup when a key is configured. Values already carrying the Fernet
+    prefix are left alone. Returns the number of entries encrypted.
+    """
+    if not _fernet:
+        return 0
+    migrated = 0
+
+    memories: dict[str, MemoryStore] = _read_json(_memories_path())  # type: ignore[assignment]
+    for store in memories.values():
+        facts = store.get("facts", [])
+        for i, fact in enumerate(facts):
+            if not fact.startswith(_FERNET_TOKEN_PREFIX):
+                facts[i] = _encrypt(fact)
+                migrated += 1
+    if migrated:
+        _write_json(_memories_path(), memories)
+
+    notes_migrated = 0
+    all_notes: list[Note] = _read_json(_notes_path()) or []  # type: ignore[assignment]
+    for entry in all_notes:
+        if not str(entry.get("note", "")).startswith(_FERNET_TOKEN_PREFIX):
+            entry["note"] = _encrypt(entry["note"])
+            notes_migrated += 1
+    if notes_migrated:
+        _write_json(_notes_path(), all_notes)
+
+    return migrated + notes_migrated
 
 
 def load_session(phone_hash: str) -> Session:

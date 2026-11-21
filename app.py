@@ -39,6 +39,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 from memory import (
+    encrypt_plaintext_entries,
     Session,
     add_memory,
     add_note,
@@ -203,17 +204,20 @@ def verify_webhook_signature(
 
 
 _PROMPT_ITEM_MAX_CHARS = 500
+_PROMPT_MAX_FACTS = 30
+_PROMPT_FACTS_BUDGET_CHARS = 6000
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def sanitise_for_prompt(text: str, max_chars: int = _PROMPT_ITEM_MAX_CHARS) -> str:
     """Flatten stored text to one bounded line so it cannot add prompt structure.
 
-    Removes control characters and newlines, strips Markdown heading/rule markers
-    and the memory block delimiters, and truncates to ``max_chars``.
+    Removes control characters and newlines, replaces angle brackets so no tag
+    (including the memory block delimiters) can be formed, strips Markdown
+    heading/rule markers, and truncates to ``max_chars``.
     """
     flat = _CONTROL_CHARS.sub(" ", str(text))
-    flat = re.sub(r"</?caller_memory>", "", flat, flags=re.IGNORECASE)
+    flat = flat.replace("<", "(").replace(">", ")")
     flat = re.sub(r"\s+", " ", flat).strip()
     flat = flat.lstrip("#-*> ").replace("---", "-")
     if len(flat) > max_chars:
@@ -230,8 +234,11 @@ def build_memory_context(phone_hash: str) -> str:
     """
     sections: list[str] = []
 
-    facts = [sanitise_for_prompt(f) for f in get_memories(phone_hash)]
+    facts = [sanitise_for_prompt(f) for f in get_memories(phone_hash)[-_PROMPT_MAX_FACTS:]]
     facts = [f for f in facts if f]
+    # Keep the newest facts that fit the budget; notes are already capped at 10 items.
+    while facts and sum(len(f) + 3 for f in facts) > _PROMPT_FACTS_BUDGET_CHARS:
+        facts.pop(0)
     if facts:
         bullet_list = "\n".join(f"- {f}" for f in facts)
         sections.append(f"Known facts about this caller:\n{bullet_list}")
@@ -388,6 +395,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.warning("ALLOW_PLAINTEXT_STORAGE=true — caller memories are stored unencrypted")
 
     ensure_data_dir()
+    migrated = encrypt_plaintext_entries()
+    if migrated:
+        logger.info("Encrypted %d memory entries written before encryption was enabled", migrated)
     _soul_template = _load_soul_template()
 
     logger.info("Bridge starting — agent_id=%s", ELEVENLABS_AGENT_ID or "(not set)")

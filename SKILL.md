@@ -141,12 +141,12 @@ When a call arrives on your Twilio number, ElevenLabs' native integration trigge
 - **What is stored:** a salted HMAC of the caller's phone number (never the raw number), caller name, call count, memory facts and notes added through the admin API.
 - **Where:** JSON files under `DATA_DIR` on the host running the bridge, encrypted at rest with Fernet.
 - **Retention:** data is kept until you delete the files under `DATA_DIR`; the bridge has no automatic expiry. Delete a caller's file to forget them.
-- **Prompt injection:** stored facts and notes are flattened to single bounded lines and fenced in a `<caller_memory>` block that tells the agent to treat it as data, never as instructions.
+- **Prompt injection:** stored facts and notes are flattened to single bounded lines (newest 30 facts within a 6,000-character budget, last 10 notes) and fenced in a `<caller_memory>` block that tells the agent to treat it as data, never as instructions.
 - **Network egress:** the bridge only answers webhooks from ElevenLabs; the system prompt it returns (soul template plus caller memory) is sent to ElevenLabs as part of that response.
 
 ## Migration from v1.2.0 to v1.2.2
 
-`DATA_ENCRYPTION_KEY` is now required. Existing plain-JSON data stays readable after you set a key; set `ALLOW_PLAINTEXT_STORAGE=true` only if you must keep running unencrypted.
+`DATA_ENCRYPTION_KEY` is now required. On the first start with a key, facts and notes written without encryption are encrypted in place (each file is rewritten atomically), so returning callers keep their context. Keep the key safe: data encrypted with a lost or different key reads as `[DECRYPTION_FAILED]`. Set `ALLOW_PLAINTEXT_STORAGE=true` only if you must keep running unencrypted.
 
 ## Migration from v1.1.x to v1.2.x
 
