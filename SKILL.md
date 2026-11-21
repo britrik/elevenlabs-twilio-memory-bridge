@@ -146,7 +146,7 @@ When a call arrives on your Twilio number, ElevenLabs' native integration trigge
 
 ## Migration from v1.2.0 to v1.2.3
 
-`DATA_ENCRYPTION_KEY` is now required. On the first start with a key, session records, facts and notes written without encryption are encrypted in place (each file is rewritten atomically), so returning callers keep their context. If a data file is not valid JSON, startup stops and names the file rather than leaving it unencrypted: restore it from a backup or move it out of `DATA_DIR`, then restart. Keep the key safe: data encrypted with a lost or different key reads as `[DECRYPTION_FAILED]`. Set `ALLOW_PLAINTEXT_STORAGE=true` only if you must keep running unencrypted.
+`DATA_ENCRYPTION_KEY` is now required. On the first start with a key, session records, facts and notes written without encryption are encrypted in place (each file is rewritten atomically), so returning callers keep their context. If a data file is not valid JSON, startup stops and names the file rather than leaving it unencrypted: restore it from a backup or move it out of `DATA_DIR`, then restart. Keep the key safe: facts and notes encrypted with a lost or different key read as `[DECRYPTION_FAILED]`, and the caller's session record is left untouched while the call gets a temporary session. Set `ALLOW_PLAINTEXT_STORAGE=true` only if you must keep running unencrypted.
 
 ## Migration from v1.1.x to v1.2.x
 

@@ -116,6 +116,11 @@ def _replace_unlocked(path: Path, data: dict | list) -> None:
         os.fsync(f.fileno())
     os.chmod(tmp, 0o600)
     tmp.replace(path)
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 def _read_json(path: Path) -> dict | list:
@@ -304,6 +309,12 @@ def _touch_session(sessions: dict, phone_hash: str) -> Session:
     now = time.time()
     session = _open_session(sessions.get(phone_hash)) if phone_hash in sessions else None
     unreadable = phone_hash in sessions and session is None
+    if unreadable:
+        logger.warning(
+            "Session record for %s can't be decrypted (wrong or missing key); "
+            "keeping it and using a temporary session",
+            phone_hash[:8],
+        )
 
     if session is not None:
         session["call_count"] = session.get("call_count", 0) + 1
