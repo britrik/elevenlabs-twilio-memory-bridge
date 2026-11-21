@@ -159,36 +159,69 @@ def _decrypt(data: str) -> str:
         return "[DECRYPTION_FAILED]"
 
 
-def encrypt_plaintext_entries() -> int:
-    """Encrypt facts and notes that were written before encryption was enabled.
+def _encrypt_file_in_place(path: Path, encrypt_entries) -> int:
+    """Encrypt plaintext entries of one JSON file under its exclusive lock.
 
-    Runs at startup when a key is configured. Values already carrying the Fernet
-    prefix are left alone. Returns the number of entries encrypted.
+    Reads, transforms and replaces the file while holding the same lock that
+    ``_write_json`` uses, so a concurrent writer cannot be overwritten. Errors
+    propagate so startup fails rather than leaving plaintext behind.
     """
-    if not _fernet:
+    if not path.exists():
         return 0
-    migrated = 0
+    with open(path, "a+", encoding="utf-8") as lockf:
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            if not content.strip():
+                return 0
+            data = json.loads(content)
+            migrated = encrypt_entries(data)
+            if migrated:
+                tmp = path.with_suffix(".tmp")
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(json.dumps(data, indent=2))
+                    f.flush()
+                    os.fsync(f.fileno())
+                tmp.replace(path)
+                os.chmod(path, 0o600)
+            return migrated
+        finally:
+            fcntl.flock(lockf, fcntl.LOCK_UN)
 
-    memories: dict[str, MemoryStore] = _read_json(_memories_path())  # type: ignore[assignment]
+
+def _encrypt_memory_facts(memories: dict) -> int:
+    migrated = 0
     for store in memories.values():
         facts = store.get("facts", [])
         for i, fact in enumerate(facts):
             if not fact.startswith(_FERNET_TOKEN_PREFIX):
                 facts[i] = _encrypt(fact)
                 migrated += 1
-    if migrated:
-        _write_json(_memories_path(), memories)
+    return migrated
 
-    notes_migrated = 0
-    all_notes: list[Note] = _read_json(_notes_path()) or []  # type: ignore[assignment]
+
+def _encrypt_note_entries(all_notes: list) -> int:
+    migrated = 0
     for entry in all_notes:
         if not str(entry.get("note", "")).startswith(_FERNET_TOKEN_PREFIX):
             entry["note"] = _encrypt(entry["note"])
-            notes_migrated += 1
-    if notes_migrated:
-        _write_json(_notes_path(), all_notes)
+            migrated += 1
+    return migrated
 
-    return migrated + notes_migrated
+
+def encrypt_plaintext_entries() -> int:
+    """Encrypt facts and notes that were written before encryption was enabled.
+
+    Runs at startup when a key is configured. Values already carrying the Fernet
+    prefix are left alone. Returns the number of entries encrypted; raises if a
+    file cannot be read or rewritten.
+    """
+    if not _fernet:
+        return 0
+    return _encrypt_file_in_place(_memories_path(), _encrypt_memory_facts) + _encrypt_file_in_place(
+        _notes_path(), _encrypt_note_entries
+    )
 
 
 def load_session(phone_hash: str) -> Session:

@@ -96,3 +96,23 @@ def test_memory_context_is_bounded_for_large_stores(monkeypatch):
     ctx = app_module.build_memory_context("abc")
     assert len(ctx) < 12_000
     assert "fact 499" in ctx and "fact 0 " not in ctx
+
+
+def test_migration_failure_is_not_swallowed(tmp_path, monkeypatch):
+    import pytest
+    from cryptography.fernet import Fernet
+
+    import memory as memory_module
+
+    monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(memory_module, "_fernet", None)
+    memory_module.add_memory("hash1", "likes jazz")
+    monkeypatch.setattr(memory_module, "_fernet", Fernet(Fernet.generate_key()))
+
+    def fail_fsync(_fd):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(memory_module.os, "fsync", fail_fsync)
+    with pytest.raises(OSError):
+        memory_module.encrypt_plaintext_entries()
+    assert "likes jazz" in (tmp_path / "memories.json").read_text()
