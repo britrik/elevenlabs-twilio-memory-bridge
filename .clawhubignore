@@ -1,0 +1,3 @@
+# Tests contain deliberate prompt-injection strings and are not part of the published skill
+tests/
+.github/

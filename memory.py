@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TypedDict
 
@@ -78,50 +79,81 @@ def _notes_path() -> Path:
     return DATA_DIR / "notes.json"
 
 
-def _read_json(path: Path) -> dict | list:
-    """Read and return parsed JSON from *path*, or an empty dict on failure."""
+def _lock_path(path: Path) -> Path:
+    return path.with_name(path.name + ".lock")
+
+
+@contextmanager
+def _file_lock(path: Path, exclusive: bool = True):
+    """Hold a lock on a sidecar file for *path*.
+
+    The sidecar keeps the same inode while *path* is replaced atomically, so
+    every reader and writer serializes on one lock.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(_lock_path(path), "a+", encoding="utf-8") as lockf:
+        fcntl.flock(lockf, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            fcntl.flock(lockf, fcntl.LOCK_UN)
+
+
+def _load_unlocked(path: Path) -> dict | list:
     if not path.exists():
         return {}
+    content = path.read_text(encoding="utf-8")
+    if not content.strip():
+        return {}
+    return json.loads(content)
+
+
+def _replace_unlocked(path: Path, data: dict | list) -> None:
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(data, indent=2))
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+
+
+def _read_json(path: Path) -> dict | list:
+    """Read and return parsed JSON from *path*, or an empty dict on failure."""
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            # Acquire shared lock for reading
-            fcntl.flock(f, fcntl.LOCK_SH)
-            try:
-                content = f.read()
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
-        return json.loads(content)
+        with _file_lock(path, exclusive=False):
+            return _load_unlocked(path)
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning("Failed to read %s: %s", path, exc)
         return {}
 
 
 def _write_json(path: Path, data: dict | list) -> None:
-    """Atomically write *data* as JSON to *path*.
-
-    Locks the target file (not the temp) so concurrent writers serialize
-    on the same lock target during the full read-modify-write cycle.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Ensure the target file exists so we can lock it
-    path.touch(exist_ok=True)
-    tmp = path.with_suffix(".tmp")
+    """Atomically write *data* as JSON to *path*."""
     try:
-        with open(path, "a+", encoding="utf-8") as lockf:
-            # Acquire exclusive lock on the target file
-            fcntl.flock(lockf, fcntl.LOCK_EX)
-            try:
-                with open(tmp, "w", encoding="utf-8") as f:
-                    f.write(json.dumps(data, indent=2))
-                    f.flush()
-                    os.fsync(f.fileno())
-                tmp.replace(path)
-                # Set restrictive permissions on the written file
-                os.chmod(path, 0o600)
-            finally:
-                fcntl.flock(lockf, fcntl.LOCK_UN)
+        with _file_lock(path):
+            _replace_unlocked(path, data)
     except OSError as exc:
         logger.warning("Failed to write %s: %s", path, exc)
+
+
+def _update_json(path: Path, update, default=dict):
+    """Read, modify and write *path* under one exclusive lock.
+
+    *update* mutates the loaded data in place and returns the caller's result.
+    """
+    with _file_lock(path):
+        try:
+            data = _load_unlocked(path) or default()
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Failed to read %s: %s", path, exc)
+            data = default()
+        result = update(data)
+        try:
+            _replace_unlocked(path, data)
+        except OSError as exc:
+            logger.warning("Failed to write %s: %s", path, exc)
+        return result
 
 
 # ── Public API ──────────────────────────────────────────────────────────────
@@ -159,39 +191,58 @@ def _decrypt(data: str) -> str:
         return "[DECRYPTION_FAILED]"
 
 
+def _seal_session(session: dict) -> dict:
+    """Encrypt a whole session record when a key is configured."""
+    if not _fernet:
+        return session
+    return {"enc": _encrypt(json.dumps(session))}
+
+
+def _is_sealed(value) -> bool:
+    return isinstance(value, dict) and set(value) == {"enc"}
+
+
+def _open_session(value) -> dict | None:
+    if not _is_sealed(value):
+        return value
+    try:
+        return json.loads(_decrypt(value["enc"]))
+    except json.JSONDecodeError:
+        logger.error("Failed to decrypt a session record — key mismatch or corruption")
+        return None
+
+
 def _encrypt_file_in_place(path: Path, encrypt_entries) -> int:
     """Encrypt plaintext entries of one JSON file under its exclusive lock.
 
-    Reads, transforms and replaces the file while holding the same lock that
-    ``_write_json`` uses, so a concurrent writer cannot be overwritten. Errors
-    propagate so startup fails rather than leaving plaintext behind.
+    Errors propagate, including unreadable JSON, so startup fails rather than
+    leaving plaintext behind.
     """
     if not path.exists():
         return 0
-    with open(path, "a+", encoding="utf-8") as lockf:
-        fcntl.flock(lockf, fcntl.LOCK_EX)
+    with _file_lock(path):
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read()
-            if not content.strip():
-                return 0
-            try:
-                data = json.loads(content)
-            except json.JSONDecodeError as exc:
-                logger.warning("Skipping encryption migration for unreadable %s: %s", path, exc)
-                return 0
-            migrated = encrypt_entries(data)
-            if migrated:
-                tmp = path.with_suffix(".tmp")
-                with open(tmp, "w", encoding="utf-8") as f:
-                    f.write(json.dumps(data, indent=2))
-                    f.flush()
-                    os.fsync(f.fileno())
-                tmp.replace(path)
-                os.chmod(path, 0o600)
-            return migrated
-        finally:
-            fcntl.flock(lockf, fcntl.LOCK_UN)
+            data = _load_unlocked(path)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"{path} is not valid JSON, so its contents cannot be encrypted. "
+                "Restore it from a backup or move it out of DATA_DIR, then restart."
+            ) from exc
+        if not data:
+            return 0
+        migrated = encrypt_entries(data)
+        if migrated:
+            _replace_unlocked(path, data)
+        return migrated
+
+
+def _encrypt_session_entries(sessions: dict) -> int:
+    migrated = 0
+    for key, value in sessions.items():
+        if not _is_sealed(value):
+            sessions[key] = _seal_session(value)
+            migrated += 1
+    return migrated
 
 
 def _encrypt_memory_facts(memories: dict) -> int:
@@ -215,7 +266,7 @@ def _encrypt_note_entries(all_notes: list) -> int:
 
 
 def encrypt_plaintext_entries() -> int:
-    """Encrypt facts and notes that were written before encryption was enabled.
+    """Encrypt sessions, facts and notes written before encryption was enabled.
 
     Runs at startup when a key is configured. Values already carrying the Fernet
     prefix are left alone. Returns the number of entries encrypted; raises if a
@@ -223,8 +274,10 @@ def encrypt_plaintext_entries() -> int:
     """
     if not _fernet:
         return 0
-    return _encrypt_file_in_place(_memories_path(), _encrypt_memory_facts) + _encrypt_file_in_place(
-        _notes_path(), _encrypt_note_entries
+    return (
+        _encrypt_file_in_place(_sessions_path(), _encrypt_session_entries)
+        + _encrypt_file_in_place(_memories_path(), _encrypt_memory_facts)
+        + _encrypt_file_in_place(_notes_path(), _encrypt_note_entries)
     )
 
 
@@ -234,11 +287,14 @@ def load_session(phone_hash: str) -> Session:
     Returns a ``Session`` dict.  The ``call_count`` is incremented each time
     this function is called (i.e., per inbound call).
     """
-    sessions: dict[str, Session] = _read_json(_sessions_path())  # type: ignore[assignment]
-    now = time.time()
+    return _update_json(_sessions_path(), lambda sessions: _touch_session(sessions, phone_hash))
 
-    if phone_hash in sessions:
-        session = sessions[phone_hash]
+
+def _touch_session(sessions: dict, phone_hash: str) -> Session:
+    now = time.time()
+    session = _open_session(sessions.get(phone_hash)) if phone_hash in sessions else None
+
+    if session is not None:
         session["call_count"] = session.get("call_count", 0) + 1
         session["last_seen"] = now
         session["active"] = True
@@ -260,18 +316,21 @@ def load_session(phone_hash: str) -> Session:
         )
         logger.info("New caller %s", phone_hash[:8])
 
-    sessions[phone_hash] = session
-    _write_json(_sessions_path(), sessions)
+    sessions[phone_hash] = _seal_session(session)
     return session
 
 
 def end_session(phone_hash: str, call_sid: str) -> None:
     """Mark the session for *phone_hash* as inactive after a call ends."""
-    sessions: dict[str, Session] = _read_json(_sessions_path())  # type: ignore[assignment]
-    if phone_hash in sessions:
-        sessions[phone_hash]["active"] = False
-        sessions[phone_hash]["last_call_sid"] = call_sid
-        _write_json(_sessions_path(), sessions)
+
+    def update(sessions: dict) -> None:
+        session = _open_session(sessions.get(phone_hash))
+        if session is not None:
+            session["active"] = False
+            session["last_call_sid"] = call_sid
+            sessions[phone_hash] = _seal_session(session)
+
+    _update_json(_sessions_path(), update)
 
 
 def get_memories(phone_hash: str) -> list[str]:
@@ -297,15 +356,16 @@ def add_memory(phone_hash: str, fact: str) -> list[str]:
 
     Returns the updated list of facts.
     """
-    memories: dict[str, MemoryStore] = _read_json(_memories_path())  # type: ignore[assignment]
-    if phone_hash not in memories:
-        memories[phone_hash] = MemoryStore(phone_hash=phone_hash, facts=[])
-    # Encrypt fact if encryption is enabled
     stored_fact = _encrypt(fact) if _fernet else fact
-    memories[phone_hash].setdefault("facts", []).append(stored_fact)
-    _write_json(_memories_path(), memories)
-    logger.info("Stored fact for %s (total: %d)", phone_hash[:8], len(memories[phone_hash]["facts"]))
-    return memories[phone_hash]["facts"]
+
+    def update(memories: dict) -> list[str]:
+        store = memories.setdefault(phone_hash, MemoryStore(phone_hash=phone_hash, facts=[]))
+        store.setdefault("facts", []).append(stored_fact)
+        return store["facts"]
+
+    facts = _update_json(_memories_path(), update)
+    logger.info("Stored fact for %s (total: %d)", phone_hash[:8], len(facts))
+    return facts
 
 
 def get_notes(phone_hash: str | None = None) -> list[Note]:
@@ -333,12 +393,9 @@ def add_note(note: str, phone_hash: str | None = None) -> Note:
     If *phone_hash* is provided the note is scoped to that caller; otherwise
     it is a global/daily note visible to all callers.
     """
-    all_notes: list[Note] = _read_json(_notes_path()) or []  # type: ignore[assignment]
-    # Encrypt note content if encryption is enabled
     stored_note = _encrypt(note) if _fernet else note
     entry = Note(timestamp=time.time(), note=stored_note, phone_hash=phone_hash)
-    all_notes.append(entry)
-    _write_json(_notes_path(), all_notes)
+    _update_json(_notes_path(), lambda all_notes: all_notes.append(dict(entry)), default=list)
     logger.info("Added note (global=%s)", phone_hash is None)
     # Return decrypted version for display
     if _fernet:

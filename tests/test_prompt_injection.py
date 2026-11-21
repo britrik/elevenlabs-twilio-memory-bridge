@@ -124,7 +124,8 @@ def test_sanitise_keeps_meaningful_leading_characters():
     assert app_module.sanitise_for_prompt("* - list item") == "list item"
 
 
-def test_migration_skips_corrupt_files(tmp_path, monkeypatch):
+def test_migration_fails_closed_on_corrupt_files(tmp_path, monkeypatch):
+    import pytest
     from cryptography.fernet import Fernet
 
     import memory as memory_module
@@ -132,5 +133,46 @@ def test_migration_skips_corrupt_files(tmp_path, monkeypatch):
     monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
     monkeypatch.setattr(memory_module, "_fernet", Fernet(Fernet.generate_key()))
     (tmp_path / "memories.json").write_text("{not json")
-    assert memory_module.encrypt_plaintext_entries() == 0
+    with pytest.raises(RuntimeError, match="not valid JSON"):
+        memory_module.encrypt_plaintext_entries()
     assert (tmp_path / "memories.json").read_text() == "{not json"
+
+
+def test_sessions_are_encrypted_at_rest_and_migrated(tmp_path, monkeypatch):
+    from cryptography.fernet import Fernet
+
+    import memory as memory_module
+
+    monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(memory_module, "_fernet", None)
+    memory_module.load_session("legacyhash")
+
+    monkeypatch.setattr(memory_module, "_fernet", Fernet(Fernet.generate_key()))
+    assert memory_module.encrypt_plaintext_entries() == 1
+    assert memory_module.encrypt_plaintext_entries() == 0
+    session = memory_module.load_session("legacyhash")
+    assert session["call_count"] == 2
+    memory_module.load_session("newhash")
+    memory_module.end_session("newhash", "CA123")
+    raw = (tmp_path / "sessions.json").read_text()
+    assert "call_count" not in raw and "CA123" not in raw
+    assert memory_module.load_session("newhash")["last_call_sid"] == "CA123"
+
+
+def test_concurrent_writes_are_not_lost(tmp_path, monkeypatch):
+    import threading
+
+    from cryptography.fernet import Fernet
+
+    import memory as memory_module
+
+    monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(memory_module, "_fernet", Fernet(Fernet.generate_key()))
+    threads = [
+        threading.Thread(target=memory_module.add_memory, args=("hash1", f"fact {i}")) for i in range(25)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(memory_module.get_memories("hash1")) == sorted(f"fact {i}" for i in range(25))
