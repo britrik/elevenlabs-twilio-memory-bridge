@@ -139,7 +139,7 @@ When a call arrives on your Twilio number, ElevenLabs' native integration trigge
 ## Data Handling
 
 - **What is stored:** a salted HMAC of the caller's phone number (never the raw number), caller name, call count, memory facts and notes added through the admin API.
-- **Where:** JSON files under `DATA_DIR` on the host running the bridge, encrypted at rest with Fernet.
+- **Where:** JSON files under `DATA_DIR` on the host running the bridge. Memory facts and notes are encrypted at rest with Fernet; the session file (phone hash, caller name, call count) is stored as plain JSON with `chmod 600`.
 - **Retention:** data is kept until you delete the files under `DATA_DIR`; the bridge has no automatic expiry. Delete a caller's file to forget them.
 - **Prompt injection:** stored facts and notes are flattened to single bounded lines (newest 30 facts within a 6,000-character budget, last 10 notes) and fenced in a `<caller_memory>` block that tells the agent to treat it as data, never as instructions.
 - **Network egress:** the bridge only answers webhooks from ElevenLabs; the system prompt it returns (soul template plus caller memory) is sent to ElevenLabs as part of that response.
