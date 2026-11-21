@@ -124,7 +124,8 @@ def test_sanitise_keeps_meaningful_leading_characters():
     assert app_module.sanitise_for_prompt("* - list item") == "list item"
 
 
-def test_migration_skips_corrupt_files(tmp_path, monkeypatch):
+def test_migration_fails_closed_on_corrupt_files(tmp_path, monkeypatch):
+    import pytest
     from cryptography.fernet import Fernet
 
     import memory as memory_module
@@ -132,5 +133,128 @@ def test_migration_skips_corrupt_files(tmp_path, monkeypatch):
     monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
     monkeypatch.setattr(memory_module, "_fernet", Fernet(Fernet.generate_key()))
     (tmp_path / "memories.json").write_text("{not json")
-    assert memory_module.encrypt_plaintext_entries() == 0
+    with pytest.raises(RuntimeError, match="not valid JSON"):
+        memory_module.encrypt_plaintext_entries()
     assert (tmp_path / "memories.json").read_text() == "{not json"
+
+
+def test_sessions_are_encrypted_at_rest_and_migrated(tmp_path, monkeypatch):
+    from cryptography.fernet import Fernet
+
+    import memory as memory_module
+
+    monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(memory_module, "_fernet", None)
+    memory_module.load_session("legacyhash")
+
+    monkeypatch.setattr(memory_module, "_fernet", Fernet(Fernet.generate_key()))
+    assert memory_module.encrypt_plaintext_entries() == 1
+    assert memory_module.encrypt_plaintext_entries() == 0
+    session = memory_module.load_session("legacyhash")
+    assert session["call_count"] == 2
+    memory_module.load_session("newhash")
+    memory_module.end_session("newhash", "CA123")
+    raw = (tmp_path / "sessions.json").read_text()
+    assert "call_count" not in raw and "CA123" not in raw
+    assert memory_module.load_session("newhash")["last_call_sid"] == "CA123"
+
+
+def test_concurrent_writes_are_not_lost(tmp_path, monkeypatch):
+    import threading
+
+    from cryptography.fernet import Fernet
+
+    import memory as memory_module
+
+    monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(memory_module, "_fernet", Fernet(Fernet.generate_key()))
+    threads = [
+        threading.Thread(target=memory_module.add_memory, args=("hash1", f"fact {i}")) for i in range(25)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(memory_module.get_memories("hash1")) == sorted(f"fact {i}" for i in range(25))
+
+
+def test_unreadable_session_is_not_overwritten(tmp_path, monkeypatch):
+    from cryptography.fernet import Fernet
+
+    import memory as memory_module
+
+    monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(memory_module, "_fernet", Fernet(Fernet.generate_key()))
+    memory_module.load_session("hash1")
+    before = (tmp_path / "sessions.json").read_text()
+    monkeypatch.setattr(memory_module, "_fernet", Fernet(Fernet.generate_key()))
+    assert memory_module.load_session("hash1")["call_count"] == 1
+    assert (tmp_path / "sessions.json").read_text() == before
+
+
+def test_updates_never_replace_an_unreadable_file(tmp_path, monkeypatch):
+    import memory as memory_module
+
+    monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(memory_module, "_fernet", None)
+    (tmp_path / "sessions.json").write_text("{damaged")
+    memory_module.end_session("hash1", "CA1")
+    memory_module.load_session("hash1")
+    assert (tmp_path / "sessions.json").read_text() == "{damaged"
+
+
+def test_writes_to_an_unreadable_file_raise_instead_of_reporting_success(tmp_path, monkeypatch):
+    import pytest
+
+    import memory as memory_module
+
+    monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(memory_module, "_fernet", None)
+    (tmp_path / "memories.json").write_text("{damaged")
+    (tmp_path / "notes.json").write_text("[damaged")
+    with pytest.raises(memory_module.StorageError):
+        memory_module.add_memory("hash1", "likes tea")
+    with pytest.raises(memory_module.StorageError):
+        memory_module.add_note("note")
+    assert (tmp_path / "memories.json").read_text() == "{damaged"
+
+
+def test_wrong_shape_json_raises_storage_error_and_is_kept(tmp_path, monkeypatch):
+    import pytest
+
+    import memory as memory_module
+
+    monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(memory_module, "_fernet", None)
+    cases = [
+        ("memories.json", "null", lambda: memory_module.add_memory("hash1", "fact")),
+        ("memories.json", '{"hash1": "not a record"}', lambda: memory_module.add_memory("hash1", "fact")),
+        ("notes.json", '{"a": 1}', lambda: memory_module.add_note("note")),
+        ("sessions.json", "[1, 2]", lambda: memory_module._update_json(
+            memory_module._sessions_path(), lambda s: memory_module._touch_session(s, "hash1"))),
+        ("sessions.json", '{"hash1": {"call_count": "x"}}', lambda: memory_module._update_json(
+            memory_module._sessions_path(), lambda s: memory_module._touch_session(s, "hash1"))),
+    ]
+    for name, content, call in cases:
+        (tmp_path / name).write_text(content)
+        with pytest.raises(memory_module.StorageError):
+            call()
+        assert (tmp_path / name).read_text() == content
+    (tmp_path / "sessions.json").write_text("[1, 2]")
+    assert memory_module.load_session("hash1")["call_count"] == 1
+
+
+def test_lock_failure_raises_storage_error(tmp_path, monkeypatch):
+    import pytest
+
+    import memory as memory_module
+
+    monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(memory_module, "_fernet", None)
+
+    def no_lock(path, exclusive=True):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(memory_module, "_file_lock", no_lock)
+    with pytest.raises(memory_module.StorageError):
+        memory_module.add_memory("hash1", "fact")

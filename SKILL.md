@@ -1,7 +1,7 @@
 ---
 name: elevenlabs-twilio-memory-bridge
 description: "FastAPI personalization webhook that adds persistent caller memory and dynamic context injection to ElevenLabs Conversational AI agents on Twilio. No audio proxying, file-based persistence, OpenClaw compatible."
-version: "1.2.2"
+version: "1.2.3"
 author: britrik
 tags: ["elevenlabs", "twilio", "voice-agent", "telephony", "conversational-ai", "memory-injection", "fastapi"]
 metadata:
@@ -128,7 +128,7 @@ When a call arrives on your Twilio number, ElevenLabs' native integration trigge
 ## Security
 
 - **Deterministic phone hashing** — Phone numbers are hashed with HMAC-SHA256 using `PHONE_HASH_SALT` as the key before storage. Changing the salt invalidates existing caller data.
-- **Encryption at rest** — Memories and notes are encrypted with Fernet. Startup fails without `DATA_ENCRYPTION_KEY` unless you explicitly set `ALLOW_PLAINTEXT_STORAGE=true`.
+- **Encryption at rest** — Session records, memories and notes are encrypted with Fernet. Startup fails without `DATA_ENCRYPTION_KEY` unless you explicitly set `ALLOW_PLAINTEXT_STORAGE=true`.
 - **Mandatory webhook verification** — `WEBHOOK_SECRET` is required in production. Webhooks are rejected when the secret is not set (fail-closed).
 - **Rate limiting** — Admin endpoints (`/api/memory`, `/api/notes`) are limited to 30 requests per minute. Webhook endpoints are limited to 60 per minute.
 - **File locking** — JSON reads and writes use POSIX advisory locks (`fcntl`) to prevent race conditions under concurrent access.
@@ -139,14 +139,14 @@ When a call arrives on your Twilio number, ElevenLabs' native integration trigge
 ## Data Handling
 
 - **What is stored:** a salted HMAC of the caller's phone number (never the raw number), caller name, call count, memory facts and notes added through the admin API.
-- **Where:** JSON files under `DATA_DIR` on the host running the bridge. Memory facts and notes are encrypted at rest with Fernet; the session file (phone hash, caller name, call count) is stored as plain JSON with `chmod 600`.
+- **Where:** JSON files under `DATA_DIR` on the host running the bridge. Each session record (caller name, call count, timestamps, last call SID), memory fact and note is encrypted at rest with Fernet; files are `chmod 600` and the directory `0700`. The phone-number HMAC is kept in clear as the lookup key. Every read-modify-write holds an exclusive lock, so concurrent calls don't lose updates.
 - **Retention:** data is kept until you delete the files under `DATA_DIR`; the bridge has no automatic expiry. Delete a caller's file to forget them.
 - **Prompt injection:** stored facts and notes are flattened to single bounded lines (newest 30 facts within a 6,000-character budget, last 10 notes) and fenced in a `<caller_memory>` block that tells the agent to treat it as data, never as instructions.
 - **Network egress:** the bridge only answers webhooks from ElevenLabs; the system prompt it returns (soul template plus caller memory) is sent to ElevenLabs as part of that response.
 
-## Migration from v1.2.0 to v1.2.2
+## Migration from v1.2.0 to v1.2.3
 
-`DATA_ENCRYPTION_KEY` is now required. On the first start with a key, facts and notes written without encryption are encrypted in place (each file is rewritten atomically), so returning callers keep their context. Keep the key safe: data encrypted with a lost or different key reads as `[DECRYPTION_FAILED]`. Set `ALLOW_PLAINTEXT_STORAGE=true` only if you must keep running unencrypted.
+`DATA_ENCRYPTION_KEY` is now required. On the first start with a key, session records, facts and notes written without encryption are encrypted in place (each file is rewritten atomically), so returning callers keep their context. If a data file is not valid JSON, startup stops and names the file rather than leaving it unencrypted: restore it from a backup or move it out of `DATA_DIR`, then restart. Keep the key safe: facts and notes encrypted with a lost or different key read as `[DECRYPTION_FAILED]`, and the caller's session record is left untouched while the call gets a temporary session. Set `ALLOW_PLAINTEXT_STORAGE=true` only if you must keep running unencrypted.
 
 ## Migration from v1.1.x to v1.2.x
 

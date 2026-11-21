@@ -41,6 +41,7 @@ from slowapi.errors import RateLimitExceeded
 from memory import (
     encrypt_plaintext_entries,
     Session,
+    StorageError,
     add_memory,
     add_note,
     end_session,
@@ -234,7 +235,11 @@ def build_memory_context(phone_hash: str) -> str:
     """
     sections: list[str] = []
 
-    facts = [sanitise_for_prompt(f) for f in get_memories(phone_hash)[-_PROMPT_MAX_FACTS:]]
+    facts = [
+        sanitise_for_prompt(f)
+        for f in get_memories(phone_hash)[-_PROMPT_MAX_FACTS:]
+        if f != "[DECRYPTION_FAILED]"
+    ]
     facts = [f for f in facts if f]
     # Keep the newest facts that fit the budget; notes are already capped at 10 items.
     while facts and sum(len(f) + 3 for f in facts) > _PROMPT_FACTS_BUDGET_CHARS:
@@ -416,7 +421,7 @@ limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
     title="ElevenLabs–Twilio Memory Bridge",
-    version="1.2.0",
+    version="1.2.3",
     description=(
         "Personalization webhook for ElevenLabs' native Twilio integration. "
         "Injects caller memory and personality into each conversation."
@@ -550,7 +555,11 @@ async def post_call(
 @limiter.limit("30/minute")
 async def api_add_memory(request: Request, phone_hash: str, body: AddMemoryRequest) -> dict:
     """Add a long-term memory fact for a caller identified by phone hash."""
-    facts = add_memory(phone_hash, body.fact)
+    try:
+        facts = add_memory(phone_hash, body.fact)
+    except StorageError as exc:
+        logger.error("%s", exc)
+        raise HTTPException(status_code=503, detail="Memory storage is unavailable") from exc
     return {"status": "ok", "phone_hash": phone_hash, "total_facts": len(facts)}
 
 
@@ -562,7 +571,11 @@ async def api_add_note(request: Request, body: AddNoteRequest) -> dict:
     If ``phone_hash`` is provided the note is scoped to that caller;
     otherwise it is visible to all callers.
     """
-    entry = add_note(body.note, body.phone_hash)
+    try:
+        entry = add_note(body.note, body.phone_hash)
+    except StorageError as exc:
+        logger.error("%s", exc)
+        raise HTTPException(status_code=503, detail="Note storage is unavailable") from exc
     return {
         "status": "ok",
         "timestamp": entry["timestamp"],
