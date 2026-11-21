@@ -190,3 +190,14 @@ def test_unreadable_session_is_not_overwritten(tmp_path, monkeypatch):
     monkeypatch.setattr(memory_module, "_fernet", Fernet(Fernet.generate_key()))
     assert memory_module.load_session("hash1")["call_count"] == 1
     assert (tmp_path / "sessions.json").read_text() == before
+
+
+def test_updates_never_replace_an_unreadable_file(tmp_path, monkeypatch):
+    import memory as memory_module
+
+    monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(memory_module, "_fernet", None)
+    (tmp_path / "sessions.json").write_text("{damaged")
+    memory_module.end_session("hash1", "CA1")
+    memory_module.load_session("hash1")
+    assert (tmp_path / "sessions.json").read_text() == "{damaged"

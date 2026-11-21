@@ -146,8 +146,9 @@ def _update_json(path: Path, update, default=dict):
         try:
             data = _load_unlocked(path) or default()
         except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Failed to read %s: %s", path, exc)
-            data = default()
+            # Keep the damaged file for recovery instead of replacing it.
+            logger.warning("Failed to read %s, not writing it: %s", path, exc)
+            return update(default())
         result = update(data)
         try:
             _replace_unlocked(path, data)
