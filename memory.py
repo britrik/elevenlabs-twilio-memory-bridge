@@ -137,23 +137,27 @@ def _write_json(path: Path, data: dict | list) -> None:
         logger.warning("Failed to write %s: %s", path, exc)
 
 
+class StorageError(RuntimeError):
+    """A data file could not be read or written, so the change was not saved."""
+
+
 def _update_json(path: Path, update, default=dict):
     """Read, modify and write *path* under one exclusive lock.
 
     *update* mutates the loaded data in place and returns the caller's result.
+    Raises ``StorageError`` without touching the file if it can't be read, so a
+    damaged file is kept for recovery, or if the write fails.
     """
     with _file_lock(path):
         try:
             data = _load_unlocked(path) or default()
         except (json.JSONDecodeError, OSError) as exc:
-            # Keep the damaged file for recovery instead of replacing it.
-            logger.warning("Failed to read %s, not writing it: %s", path, exc)
-            return update(default())
+            raise StorageError(f"Failed to read {path}: {exc}") from exc
         result = update(data)
         try:
             _replace_unlocked(path, data)
         except OSError as exc:
-            logger.warning("Failed to write %s: %s", path, exc)
+            raise StorageError(f"Failed to write {path}: {exc}") from exc
         return result
 
 
@@ -288,7 +292,12 @@ def load_session(phone_hash: str) -> Session:
     Returns a ``Session`` dict.  The ``call_count`` is incremented each time
     this function is called (i.e., per inbound call).
     """
-    return _update_json(_sessions_path(), lambda sessions: _touch_session(sessions, phone_hash))
+    try:
+        return _update_json(_sessions_path(), lambda sessions: _touch_session(sessions, phone_hash))
+    except StorageError as exc:
+        # The call still goes ahead, without persisted history.
+        logger.error("%s; using a temporary session", exc)
+        return _touch_session({}, phone_hash)
 
 
 def _touch_session(sessions: dict, phone_hash: str) -> Session:
@@ -334,7 +343,10 @@ def end_session(phone_hash: str, call_sid: str) -> None:
             session["last_call_sid"] = call_sid
             sessions[phone_hash] = _seal_session(session)
 
-    _update_json(_sessions_path(), update)
+    try:
+        _update_json(_sessions_path(), update)
+    except StorageError as exc:
+        logger.error("%s; session end not recorded", exc)
 
 
 def get_memories(phone_hash: str) -> list[str]:

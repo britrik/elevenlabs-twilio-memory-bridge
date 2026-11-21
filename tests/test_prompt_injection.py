@@ -201,3 +201,19 @@ def test_updates_never_replace_an_unreadable_file(tmp_path, monkeypatch):
     memory_module.end_session("hash1", "CA1")
     memory_module.load_session("hash1")
     assert (tmp_path / "sessions.json").read_text() == "{damaged"
+
+
+def test_writes_to_an_unreadable_file_raise_instead_of_reporting_success(tmp_path, monkeypatch):
+    import pytest
+
+    import memory as memory_module
+
+    monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(memory_module, "_fernet", None)
+    (tmp_path / "memories.json").write_text("{damaged")
+    (tmp_path / "notes.json").write_text("[damaged")
+    with pytest.raises(memory_module.StorageError):
+        memory_module.add_memory("hash1", "likes tea")
+    with pytest.raises(memory_module.StorageError):
+        memory_module.add_note("note")
+    assert (tmp_path / "memories.json").read_text() == "{damaged"

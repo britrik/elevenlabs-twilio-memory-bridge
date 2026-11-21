@@ -41,6 +41,7 @@ from slowapi.errors import RateLimitExceeded
 from memory import (
     encrypt_plaintext_entries,
     Session,
+    StorageError,
     add_memory,
     add_note,
     end_session,
@@ -550,7 +551,11 @@ async def post_call(
 @limiter.limit("30/minute")
 async def api_add_memory(request: Request, phone_hash: str, body: AddMemoryRequest) -> dict:
     """Add a long-term memory fact for a caller identified by phone hash."""
-    facts = add_memory(phone_hash, body.fact)
+    try:
+        facts = add_memory(phone_hash, body.fact)
+    except StorageError as exc:
+        logger.error("%s", exc)
+        raise HTTPException(status_code=503, detail="Memory storage is unavailable") from exc
     return {"status": "ok", "phone_hash": phone_hash, "total_facts": len(facts)}
 
 
@@ -562,7 +567,11 @@ async def api_add_note(request: Request, body: AddNoteRequest) -> dict:
     If ``phone_hash`` is provided the note is scoped to that caller;
     otherwise it is visible to all callers.
     """
-    entry = add_note(body.note, body.phone_hash)
+    try:
+        entry = add_note(body.note, body.phone_hash)
+    except StorageError as exc:
+        logger.error("%s", exc)
+        raise HTTPException(status_code=503, detail="Note storage is unavailable") from exc
     return {
         "status": "ok",
         "timestamp": entry["timestamp"],
