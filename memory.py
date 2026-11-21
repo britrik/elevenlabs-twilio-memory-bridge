@@ -293,6 +293,7 @@ def load_session(phone_hash: str) -> Session:
 def _touch_session(sessions: dict, phone_hash: str) -> Session:
     now = time.time()
     session = _open_session(sessions.get(phone_hash)) if phone_hash in sessions else None
+    unreadable = phone_hash in sessions and session is None
 
     if session is not None:
         session["call_count"] = session.get("call_count", 0) + 1
@@ -316,7 +317,9 @@ def _touch_session(sessions: dict, phone_hash: str) -> Session:
         )
         logger.info("New caller %s", phone_hash[:8])
 
-    sessions[phone_hash] = _seal_session(session)
+    if not unreadable:
+        # Leave an undecryptable record alone so restoring the right key recovers it.
+        sessions[phone_hash] = _seal_session(session)
     return session
 
 

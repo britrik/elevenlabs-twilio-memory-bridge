@@ -176,3 +176,17 @@ def test_concurrent_writes_are_not_lost(tmp_path, monkeypatch):
     for t in threads:
         t.join()
     assert sorted(memory_module.get_memories("hash1")) == sorted(f"fact {i}" for i in range(25))
+
+
+def test_unreadable_session_is_not_overwritten(tmp_path, monkeypatch):
+    from cryptography.fernet import Fernet
+
+    import memory as memory_module
+
+    monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(memory_module, "_fernet", Fernet(Fernet.generate_key()))
+    memory_module.load_session("hash1")
+    before = (tmp_path / "sessions.json").read_text()
+    monkeypatch.setattr(memory_module, "_fernet", Fernet(Fernet.generate_key()))
+    assert memory_module.load_session("hash1")["call_count"] == 1
+    assert (tmp_path / "sessions.json").read_text() == before
