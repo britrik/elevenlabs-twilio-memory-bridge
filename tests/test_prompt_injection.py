@@ -242,3 +242,19 @@ def test_wrong_shape_json_raises_storage_error_and_is_kept(tmp_path, monkeypatch
         assert (tmp_path / name).read_text() == content
     (tmp_path / "sessions.json").write_text("[1, 2]")
     assert memory_module.load_session("hash1")["call_count"] == 1
+
+
+def test_lock_failure_raises_storage_error(tmp_path, monkeypatch):
+    import pytest
+
+    import memory as memory_module
+
+    monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(memory_module, "_fernet", None)
+
+    def no_lock(path, exclusive=True):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(memory_module, "_file_lock", no_lock)
+    with pytest.raises(memory_module.StorageError):
+        memory_module.add_memory("hash1", "fact")

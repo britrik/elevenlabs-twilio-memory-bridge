@@ -235,7 +235,11 @@ def build_memory_context(phone_hash: str) -> str:
     """
     sections: list[str] = []
 
-    facts = [sanitise_for_prompt(f) for f in get_memories(phone_hash)[-_PROMPT_MAX_FACTS:]]
+    facts = [
+        sanitise_for_prompt(f)
+        for f in get_memories(phone_hash)[-_PROMPT_MAX_FACTS:]
+        if f != "[DECRYPTION_FAILED]"
+    ]
     facts = [f for f in facts if f]
     # Keep the newest facts that fit the budget; notes are already capped at 10 items.
     while facts and sum(len(f) + 3 for f in facts) > _PROMPT_FACTS_BUDGET_CHARS:
@@ -417,7 +421,7 @@ limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
     title="ElevenLabs–Twilio Memory Bridge",
-    version="1.2.0",
+    version="1.2.3",
     description=(
         "Personalization webhook for ElevenLabs' native Twilio integration. "
         "Injects caller memory and personality into each conversation."

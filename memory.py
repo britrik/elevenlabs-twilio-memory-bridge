@@ -14,7 +14,7 @@ import json
 import logging
 import os
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import TypedDict
 
@@ -110,7 +110,8 @@ def _load_unlocked(path: Path) -> dict | list:
 
 def _replace_unlocked(path: Path, data: dict | list) -> None:
     tmp = path.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with open(fd, "w", encoding="utf-8") as f:
         f.write(json.dumps(data, indent=2))
         f.flush()
         os.fsync(f.fileno())
@@ -133,15 +134,6 @@ def _read_json(path: Path) -> dict | list:
         return {}
 
 
-def _write_json(path: Path, data: dict | list) -> None:
-    """Atomically write *data* as JSON to *path*."""
-    try:
-        with _file_lock(path):
-            _replace_unlocked(path, data)
-    except OSError as exc:
-        logger.warning("Failed to write %s: %s", path, exc)
-
-
 class StorageError(RuntimeError):
     """A data file could not be read or written, so the change was not saved."""
 
@@ -153,7 +145,11 @@ def _update_json(path: Path, update, default=dict):
     Raises ``StorageError`` without touching the file if it can't be read, so a
     damaged file is kept for recovery, or if the write fails.
     """
-    with _file_lock(path):
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(_file_lock(path))
+        except OSError as exc:
+            raise StorageError(f"Failed to lock {path}: {exc}") from exc
         try:
             data = _load_unlocked(path)
         except (json.JSONDecodeError, OSError) as exc:
@@ -240,7 +236,11 @@ def _encrypt_file_in_place(path: Path, encrypt_entries) -> int:
     """
     if not path.exists():
         return 0
-    with _file_lock(path):
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(_file_lock(path))
+        except OSError as exc:
+            raise StorageError(f"Failed to lock {path}: {exc}") from exc
         try:
             data = _load_unlocked(path)
         except json.JSONDecodeError as exc:

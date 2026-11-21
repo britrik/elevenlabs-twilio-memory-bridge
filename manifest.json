@@ -55,12 +55,17 @@
       {
         "key": "WEBHOOK_SECRET",
         "description": "Shared secret for HMAC webhook verification (required — fail-closed)"
+      },
+      {
+        "key": "DATA_ENCRYPTION_KEY",
+        "description": "Fernet key for encrypting session records, memories and notes at rest (required unless ALLOW_PLAINTEXT_STORAGE=true). Generate with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
       }
     ],
     "optional_env": [
       {
-        "key": "DATA_ENCRYPTION_KEY",
-        "description": "Fernet key for encrypting memories and notes at rest. Generate with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+        "key": "ALLOW_PLAINTEXT_STORAGE",
+        "description": "Set to true to run without DATA_ENCRYPTION_KEY and store plain JSON (not recommended)",
+        "default": "false"
       },
       {
         "key": "SOUL_TEMPLATE_PATH",
