@@ -43,6 +43,12 @@ A lightweight production bridge that adds **persistent caller memory** and **dyn
 6. ElevenLabs starts the conversation with full caller context injected
 7. The LLM backend is your **OpenClaw** instance (or any OpenAI-compatible endpoint)
 
+### Privacy: what leaves your server
+
+The bridge makes no outbound calls, but the personalized system prompt it returns includes the caller's name, call count, stored memory facts and recent notes. ElevenLabs receives that prompt and sends it, along with the live conversation, to the LLM configured on your agent (OpenClaw or another OpenAI-compatible endpoint). Each provider processes and retains that data under its own terms.
+
+Don't store facts or notes that callers wouldn't expect to be shared with those providers (health, financial, government ID or payment details, or other sensitive personal data). Tell callers that their details are remembered between calls and processed by these providers, and get consent where your jurisdiction requires it.
+
 ## Prerequisites
 
 - **Python 3.10+**

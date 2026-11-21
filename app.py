@@ -421,7 +421,7 @@ limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
     title="ElevenLabs–Twilio Memory Bridge",
-    version="1.2.3",
+    version="1.2.4",
     description=(
         "Personalization webhook for ElevenLabs' native Twilio integration. "
         "Injects caller memory and personality into each conversation."
