@@ -20,6 +20,7 @@ def tmp_data_dir(tmp_path, monkeypatch):
     """Redirect DATA_DIR so lifespan's ensure_data_dir() doesn't touch the real filesystem."""
     monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
     monkeypatch.setattr(app_module, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(app_module, "DATA_ENCRYPTION_KEY", "configured-in-test")
     return tmp_path
 
 
@@ -57,3 +58,25 @@ def test_info_when_webhook_secret_is_set(tmp_data_dir, monkeypatch, caplog):  # 
         and rec.levelno == logging.INFO
         for rec in caplog.records
     ), "Expected an INFO message about webhook verification being enabled"
+
+
+def test_startup_refuses_plaintext_storage_by_default(tmp_data_dir, monkeypatch):  # noqa: ARG001
+    monkeypatch.setattr(app_module, "PHONE_HASH_SALT", "salt")
+    monkeypatch.setattr(app_module, "WEBHOOK_SECRET", "secret")
+    monkeypatch.setattr(app_module, "DATA_ENCRYPTION_KEY", "")
+    monkeypatch.setattr(app_module, "ALLOW_PLAINTEXT_STORAGE", False)
+
+    with pytest.raises(RuntimeError, match="DATA_ENCRYPTION_KEY"):
+        asyncio.get_event_loop().run_until_complete(_run_lifespan_startup())
+
+
+def test_startup_allows_explicit_plaintext_opt_out(tmp_data_dir, monkeypatch, caplog):  # noqa: ARG001
+    monkeypatch.setattr(app_module, "PHONE_HASH_SALT", "salt")
+    monkeypatch.setattr(app_module, "WEBHOOK_SECRET", "secret")
+    monkeypatch.setattr(app_module, "DATA_ENCRYPTION_KEY", "")
+    monkeypatch.setattr(app_module, "ALLOW_PLAINTEXT_STORAGE", True)
+
+    with caplog.at_level(logging.WARNING, logger="bridge"):
+        asyncio.get_event_loop().run_until_complete(_run_lifespan_startup())
+
+    assert any("stored unencrypted" in rec.message for rec in caplog.records)
