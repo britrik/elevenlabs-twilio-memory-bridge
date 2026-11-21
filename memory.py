@@ -155,10 +155,20 @@ def _update_json(path: Path, update, default=dict):
     """
     with _file_lock(path):
         try:
-            data = _load_unlocked(path) or default()
+            data = _load_unlocked(path)
         except (json.JSONDecodeError, OSError) as exc:
             raise StorageError(f"Failed to read {path}: {exc}") from exc
-        result = update(data)
+        empty = default()
+        if data == {}:
+            data = empty
+        if not isinstance(data, type(empty)):
+            raise StorageError(
+                f"{path} holds a JSON {type(data).__name__}, expected {type(empty).__name__}"
+            )
+        try:
+            result = update(data)
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise StorageError(f"{path} has a malformed record: {exc!r}") from exc
         try:
             _replace_unlocked(path, data)
         except OSError as exc:

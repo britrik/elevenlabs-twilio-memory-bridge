@@ -217,3 +217,28 @@ def test_writes_to_an_unreadable_file_raise_instead_of_reporting_success(tmp_pat
     with pytest.raises(memory_module.StorageError):
         memory_module.add_note("note")
     assert (tmp_path / "memories.json").read_text() == "{damaged"
+
+
+def test_wrong_shape_json_raises_storage_error_and_is_kept(tmp_path, monkeypatch):
+    import pytest
+
+    import memory as memory_module
+
+    monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(memory_module, "_fernet", None)
+    cases = [
+        ("memories.json", "null", lambda: memory_module.add_memory("hash1", "fact")),
+        ("memories.json", '{"hash1": "not a record"}', lambda: memory_module.add_memory("hash1", "fact")),
+        ("notes.json", '{"a": 1}', lambda: memory_module.add_note("note")),
+        ("sessions.json", "[1, 2]", lambda: memory_module._update_json(
+            memory_module._sessions_path(), lambda s: memory_module._touch_session(s, "hash1"))),
+        ("sessions.json", '{"hash1": {"call_count": "x"}}', lambda: memory_module._update_json(
+            memory_module._sessions_path(), lambda s: memory_module._touch_session(s, "hash1"))),
+    ]
+    for name, content, call in cases:
+        (tmp_path / name).write_text(content)
+        with pytest.raises(memory_module.StorageError):
+            call()
+        assert (tmp_path / name).read_text() == content
+    (tmp_path / "sessions.json").write_text("[1, 2]")
+    assert memory_module.load_session("hash1")["call_count"] == 1
