@@ -314,6 +314,32 @@ def _import_legacy_json() -> int:
     paths = {name: DATA_DIR / name for name in _LEGACY_FILES}
     if not any(p.exists() for p in paths.values()):
         return 0
+    # Read the files under the write lock: another worker may be importing and
+    # renaming them at the same time.
+    with _transaction() as conn:
+        if conn.execute("SELECT 1 FROM meta WHERE key = 'legacy_json_imported'").fetchone():
+            # Already imported (by another worker, or before a crash left the files behind).
+            imported = 0
+        else:
+            imported = _insert_legacy_rows(conn, paths)
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('legacy_json_imported', ?)",
+                (str(time.time()),),
+            )
+
+    # Another worker may have renamed these already.
+    for path in paths.values():
+        try:
+            path.replace(path.with_name(path.name + ".migrated"))
+        except FileNotFoundError:
+            pass
+        path.with_name(path.name + ".lock").unlink(missing_ok=True)
+    if imported:
+        logger.info("Imported %d records from JSON files into %s", imported, db_path())
+    return imported
+
+
+def _insert_legacy_rows(conn: sqlite3.Connection, paths: dict[str, Path]) -> int:
     sessions = _load_legacy(paths["sessions.json"], dict) or {}
     memories = _load_legacy(paths["memories.json"], dict) or {}
     notes = _load_legacy(paths["notes.json"], list) or []
@@ -335,32 +361,12 @@ def _import_legacy_json() -> int:
             "imported. Fix it or move it out of DATA_DIR, then restart."
         ) from exc
 
-    with _transaction() as conn:
-        if conn.execute("SELECT 1 FROM meta WHERE key = 'legacy_json_imported'").fetchone():
-            # A crash after the commit left the files behind; don't import them twice.
-            logger.warning("JSON files in %s were already imported; renaming them", DATA_DIR)
-            session_rows, memory_rows, note_rows = [], [], []
-        conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('legacy_json_imported', ?)",
-            (str(time.time()),),
-        )
-        conn.executemany(
-            "INSERT OR REPLACE INTO sessions (phone_hash, record) VALUES (?, ?)", session_rows
-        )
-        conn.executemany("INSERT INTO memories (phone_hash, fact) VALUES (?, ?)", memory_rows)
-        conn.executemany(
-            "INSERT INTO notes (timestamp, note, phone_hash) VALUES (?, ?, ?)", note_rows
-        )
-    imported = len(session_rows) + len(memory_rows) + len(note_rows)
-
-    for path in paths.values():
-        if path.exists():
-            path.replace(path.with_name(path.name + ".migrated"))
-        lock = path.with_name(path.name + ".lock")
-        if lock.exists():
-            lock.unlink()
-    logger.info("Imported %d records from JSON files into %s", imported, db_path())
-    return imported
+    conn.executemany(
+        "INSERT OR REPLACE INTO sessions (phone_hash, record) VALUES (?, ?)", session_rows
+    )
+    conn.executemany("INSERT INTO memories (phone_hash, fact) VALUES (?, ?)", memory_rows)
+    conn.executemany("INSERT INTO notes (timestamp, note, phone_hash) VALUES (?, ?, ?)", note_rows)
+    return len(session_rows) + len(memory_rows) + len(note_rows)
 
 
 def encrypt_plaintext_entries() -> int:
@@ -398,8 +404,19 @@ def encrypt_plaintext_entries() -> int:
                     f"UPDATE {table} SET {column} = ? WHERE id = ?", (_encrypt(value), row_id)
                 )
             migrated += len(rows)
-    if migrated:
+        if migrated:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('plaintext_checkpoint_pending', '1')"
+            )
+        pending = conn.execute(
+            "SELECT 1 FROM meta WHERE key = 'plaintext_checkpoint_pending'"
+        ).fetchone()
+    if pending:
+        # Old plaintext page versions stay in the WAL until it is checkpointed and
+        # truncated. The flag survives a failed attempt so the next startup retries.
         _checkpoint()
+        with _transaction() as conn:
+            conn.execute("DELETE FROM meta WHERE key = 'plaintext_checkpoint_pending'")
     return migrated
 
 
@@ -407,9 +424,14 @@ def _checkpoint() -> None:
     """Copy the WAL into the database and truncate it, dropping old page versions."""
     with _conn_lock:
         try:
-            _connection().execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            busy, _, _ = _connection().execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         except sqlite3.Error as exc:
             raise StorageError(f"Failed to checkpoint {db_path()}: {exc}") from exc
+    if busy:
+        raise StorageError(
+            f"Could not checkpoint {db_path()}: another connection kept it busy for "
+            f"{_BUSY_TIMEOUT_MS} ms. Restart the bridge to retry."
+        )
 
 
 # ── Public API ──────────────────────────────────────────────────────────────
@@ -563,14 +585,16 @@ def backup(dest: str | Path) -> Path:
     its ``-wal`` file. *dest* must not exist yet.
     """
     dest = Path(dest)
-    if dest.exists():
-        raise FileExistsError(f"{dest} already exists")
-    with _conn_lock:
-        try:
+    # Create it empty and owner-only first, so the copy is never readable by others.
+    # VACUUM INTO accepts an existing empty file.
+    os.close(os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    try:
+        os.chmod(dest, 0o600)
+        with _conn_lock:
             _connection().execute("VACUUM INTO ?", (str(dest),))
-        except sqlite3.Error as exc:
-            raise StorageError(f"Failed to back up {db_path()} to {dest}: {exc}") from exc
-    os.chmod(dest, 0o600)
+    except (sqlite3.Error, OSError) as exc:
+        dest.unlink(missing_ok=True)
+        raise StorageError(f"Failed to back up {db_path()} to {dest}: {exc}") from exc
     return dest
 
 

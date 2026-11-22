@@ -150,3 +150,62 @@ def test_lifespan_imports_json_and_closes_the_database(data_dir, monkeypatch):
     finally:
         loop.close()
     assert memory_module._conn is None
+
+
+def _run_init_db(data_dir):
+    memory_module.DATA_DIR = data_dir
+    memory_module._fernet = None
+    memory_module.init_db()
+
+
+def test_workers_starting_together_import_the_json_once(data_dir):
+    _legacy_files(data_dir)
+    ctx = multiprocessing.get_context("spawn")
+    procs = [ctx.Process(target=_run_init_db, args=(data_dir,)) for _ in range(4)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(60)
+        assert p.exitcode == 0
+    assert memory_module.get_memories("hash1") == ["likes jazz", "prefers mornings"]
+    assert memory_module._query("SELECT COUNT(*) FROM notes") == [(3,)]
+    assert not (data_dir / "memories.json").exists()
+
+
+def test_busy_checkpoint_fails_startup_and_is_retried(data_dir, monkeypatch):
+    monkeypatch.setattr(memory_module, "_BUSY_TIMEOUT_MS", 100)
+    memory_module.add_memory("hash1", "likes jazz")
+    monkeypatch.setattr(memory_module, "_fernet", Fernet(Fernet.generate_key()))
+
+    reader = sqlite3.connect(data_dir / "bridge.db", isolation_level=None)
+    reader.execute("BEGIN")
+    reader.execute("SELECT * FROM memories").fetchall()
+    with pytest.raises(memory_module.StorageError, match="checkpoint"):
+        memory_module.encrypt_plaintext_entries()
+    reader.execute("COMMIT")
+    reader.close()
+
+    assert memory_module.encrypt_plaintext_entries() == 0
+    raw = b"".join(p.read_bytes() for p in data_dir.glob("bridge.db*"))
+    assert b"likes jazz" not in raw
+    assert memory_module._query("SELECT key FROM meta WHERE key = 'plaintext_checkpoint_pending'") == []
+
+
+def test_backup_is_owner_only_from_the_start(data_dir, tmp_path_factory, monkeypatch):
+    memory_module.add_memory("hash1", "likes tea")
+    dest = tmp_path_factory.mktemp("backup") / "b.db"
+    seen = []
+    real_connection = memory_module._connection
+
+    class Spy:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args):
+            if sql.startswith("VACUUM INTO"):
+                seen.append(stat.S_IMODE(dest.stat().st_mode))
+            return self._conn.execute(sql, *args)
+
+    monkeypatch.setattr(memory_module, "_connection", lambda: Spy(real_connection()))
+    memory_module.backup(dest)
+    assert seen == [0o600]
