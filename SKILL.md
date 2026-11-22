@@ -1,7 +1,7 @@
 ---
 name: elevenlabs-twilio-memory-bridge
-description: "FastAPI personalization webhook that adds persistent caller memory and dynamic context injection to ElevenLabs Conversational AI agents on Twilio. No audio proxying, file-based persistence, OpenClaw compatible."
-version: "1.2.4"
+description: "FastAPI personalization webhook that adds persistent caller memory and dynamic context injection to ElevenLabs Conversational AI agents on Twilio. No audio proxying, SQLite persistence, OpenClaw compatible."
+version: "1.3.0"
 author: britrik
 tags: ["elevenlabs", "twilio", "voice-agent", "telephony", "conversational-ai", "memory-injection", "fastapi"]
 metadata:
@@ -45,13 +45,13 @@ metadata:
         description: Fernet key for encrypting session records, memories and notes at rest. Required: the bridge refuses to start without it unless ALLOW_PLAINTEXT_STORAGE=true.
       - name: ALLOW_PLAINTEXT_STORAGE
         required: false
-        description: Set to true to run without DATA_ENCRYPTION_KEY and store caller data as plain JSON (not recommended).
+        description: Set to true to run without DATA_ENCRYPTION_KEY and store caller data unencrypted (not recommended).
       - name: SOUL_TEMPLATE_PATH
         required: false
         description: Path to personality template file (default ./soul_template.md).
       - name: DATA_DIR
         required: false
-        description: Directory for JSON persistence (default ./data).
+        description: Directory holding the SQLite database bridge.db (default ./data).
       - name: ALLOWED_ORIGINS
         required: false
         description: Comma-separated CORS origins (leave unset to disable CORS).
@@ -80,7 +80,7 @@ When a call arrives on your Twilio number, ElevenLabs' native integration trigge
 
 - **No audio proxying** — ElevenLabs and Twilio handle media directly
 - **Webhook only** — called once per inbound call to inject context
-- **File-based persistence** — JSON files in `./data/`, zero external dependencies
+- **SQLite persistence** — one `bridge.db` file in `./data/` via Python's built-in `sqlite3`, no database server
 - **OpenClaw compatible** — works with any OpenAI-compatible LLM endpoint
 
 ## Endpoints
@@ -119,7 +119,7 @@ When a call arrives on your Twilio number, ElevenLabs' native integration trigge
 |----------|---------|---------|
 | `DATA_ENCRYPTION_KEY` | _(unset)_ | Fernet key for encrypting memories and notes at rest. Generate with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. Required unless `ALLOW_PLAINTEXT_STORAGE=true`; the bridge refuses to start without it. |
 | `SOUL_TEMPLATE_PATH` | `./soul_template.md` | Path to personality template file |
-| `DATA_DIR` | `./data` | Directory for JSON persistence |
+| `DATA_DIR` | `./data` | Directory holding the SQLite database `bridge.db` |
 | `ALLOWED_ORIGINS` | _(unset)_ | Comma-separated CORS origins |
 | `HOST` | `0.0.0.0` | Bind address for uvicorn |
 | `PORT` | `8000` | Listen port |
@@ -131,20 +131,26 @@ When a call arrives on your Twilio number, ElevenLabs' native integration trigge
 - **Encryption at rest** — Session records, memories and notes are encrypted with Fernet. Startup fails without `DATA_ENCRYPTION_KEY` unless you explicitly set `ALLOW_PLAINTEXT_STORAGE=true`.
 - **Mandatory webhook verification** — `WEBHOOK_SECRET` is required in production. Webhooks are rejected when the secret is not set (fail-closed).
 - **Rate limiting** — Admin endpoints (`/api/memory`, `/api/notes`) are limited to 30 requests per minute. Webhook endpoints are limited to 60 per minute.
-- **File locking** — JSON reads and writes use POSIX advisory locks (`fcntl`) to prevent race conditions under concurrent access.
-- **Restrictive permissions** — Data directory (`DATA_DIR`) is created with `0o700` permissions. JSON files are written with `0o600`.
+- **Serialized writes** — SQLite runs in WAL mode with a 5 s busy timeout; every read-modify-write is one `BEGIN IMMEDIATE` transaction, so concurrent calls don't lose updates.
+- **Restrictive permissions** — Data directory (`DATA_DIR`) is created with `0o700` permissions. The database and its WAL files are `0o600`.
 - **Secrets from env vars only** — No hardcoded credentials in source.
 - **Safe for public GitHub repos** — All sensitive config is loaded from environment variables.
 
 ## Data Handling
 
 - **What is stored:** a salted HMAC of the caller's phone number (never the raw number), caller name, call count, memory facts and notes added through the admin API.
-- **Where:** JSON files under `DATA_DIR` on the host running the bridge. Each session record (caller name, call count, timestamps, last call SID), memory fact and note is encrypted at rest with Fernet; files are `chmod 600` and the directory `0700`. The phone-number HMAC is kept in clear as the lookup key. Every read-modify-write holds an exclusive lock, so concurrent calls don't lose updates.
-- **Retention:** data is kept until you delete the files under `DATA_DIR`; the bridge has no automatic expiry. Delete a caller's file to forget them.
+- **Where:** the SQLite database `bridge.db` under `DATA_DIR` on the host running the bridge. Each session record (caller name, call count, timestamps, last call SID), memory fact and note is encrypted at rest with Fernet; the database files are `chmod 600` and the directory `0700`. The phone-number HMAC is kept in clear as the lookup key. Every read-modify-write is one SQLite write transaction, so concurrent calls don't lose updates.
+- **Retention:** data is kept until you delete it; the bridge has no automatic expiry. To forget a caller, delete their rows: `DELETE FROM sessions WHERE phone_hash = ?; DELETE FROM memories WHERE phone_hash = ?; DELETE FROM notes WHERE phone_hash = ?;`. Deleted content is overwritten (`secure_delete` is on).
 - **Prompt injection:** stored facts and notes are flattened to single bounded lines (newest 30 facts within a 6,000-character budget, last 10 notes) and fenced in a `<caller_memory>` block that tells the agent to treat it as data, never as instructions.
 - **Network egress:** the bridge makes no outbound calls of its own; it only answers webhooks from ElevenLabs.
 - **Third parties that receive caller data:** the system prompt the bridge returns contains the caller's name, call count, stored memory facts and recent notes. ElevenLabs receives it in the webhook response and passes it, with the live call transcript, to the LLM configured on the agent (your OpenClaw instance at `OPENCLAW_API_BASE_URL`, or another OpenAI-compatible endpoint). Each provider handles that data under its own terms and retention policy.
 - **Before you store anything:** don't save facts or notes that callers would not expect to be shared with ElevenLabs and your LLM provider (health, financial, government ID or payment details, or other sensitive personal data). Tell callers their details are remembered between calls and processed by these providers, and get consent where your jurisdiction requires it.
+
+## Migration from v1.2.x to v1.3.0
+
+Storage moves from JSON files to one SQLite database, `DATA_DIR/bridge.db`. On the first start, `sessions.json`, `memories.json` and `notes.json` are imported in a single transaction and renamed to `*.migrated`; delete those once you have checked the bridge, because they still hold whatever they held before (plaintext if you never set a key). If a JSON file is not valid, startup stops, names the file and imports nothing. Startup also runs `PRAGMA integrity_check` and refuses to start on a damaged database.
+
+**Backups:** don't copy `bridge.db` while the bridge is running (recent writes live in `bridge.db-wal`). Take a consistent copy with `python -c "import memory; memory.backup('/path/to/backup.db')"` from the bridge directory with the same `DATA_DIR`, or `sqlite3 data/bridge.db "VACUUM INTO '/path/to/backup.db'"`.
 
 ## Migration from v1.2.0 to v1.2.3 and later
 

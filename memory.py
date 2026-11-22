@@ -1,22 +1,23 @@
 """In-process memory and session management for the voice-agent bridge.
 
-Stores caller sessions, long-term memory (facts), and daily notes as JSON
-files under ``DATA_DIR``.  All functions are synchronous and file-backed so
-the bridge can run without an external database.
+Stores caller sessions, long-term memory (facts) and daily notes in one
+SQLite database (``DATA_DIR/bridge.db``) in WAL mode, using only the standard
+library ``sqlite3`` module so the bridge runs without an external database.
 
 Data at rest is encrypted with Fernet when ``DATA_ENCRYPTION_KEY`` is set.
 """
 
 from __future__ import annotations
 
-import fcntl
 import json
 import logging
 import os
+import sqlite3
+import threading
 import time
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TypedDict
+from typing import Iterator, TypedDict
 
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
@@ -28,6 +29,33 @@ logger = logging.getLogger(__name__)
 DATA_DIR: Path = Path(os.getenv("DATA_DIR", "./data"))
 _DATA_ENCRYPTION_KEY: str | None = os.getenv("DATA_ENCRYPTION_KEY")
 _fernet: Fernet | None = Fernet(_DATA_ENCRYPTION_KEY.encode()) if _DATA_ENCRYPTION_KEY else None
+
+DB_FILENAME = "bridge.db"
+_BUSY_TIMEOUT_MS = 5000
+_SCHEMA_VERSION = 1
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS sessions (
+    phone_hash TEXT PRIMARY KEY,
+    record     TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS memories (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone_hash TEXT NOT NULL,
+    fact       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS memories_phone_hash ON memories (phone_hash, id);
+CREATE TABLE IF NOT EXISTS notes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp  REAL NOT NULL,
+    note       TEXT NOT NULL,
+    phone_hash TEXT
+);
+CREATE INDEX IF NOT EXISTS notes_phone_hash ON notes (phone_hash, id);
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"""
 
 
 # ── Type definitions ────────────────────────────────────────────────────────
@@ -61,126 +89,111 @@ class Note(TypedDict):
     phone_hash: str | None
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
+class StorageError(RuntimeError):
+    """The database could not be read or written, so the change was not saved."""
 
 
-def _sessions_path() -> Path:
-    """Return the path to the sessions JSON file."""
-    return DATA_DIR / "sessions.json"
+# ── Database connection ─────────────────────────────────────────────────────
 
 
-def _memories_path() -> Path:
-    """Return the path to the memories JSON file."""
-    return DATA_DIR / "memories.json"
+def db_path() -> Path:
+    """Return the path to the SQLite database."""
+    return DATA_DIR / DB_FILENAME
 
 
-def _notes_path() -> Path:
-    """Return the path to the notes JSON file."""
-    return DATA_DIR / "notes.json"
+_conn_lock = threading.RLock()
+_conn: sqlite3.Connection | None = None
+_conn_path: Path | None = None
 
 
-def _lock_path(path: Path) -> Path:
-    return path.with_name(path.name + ".lock")
+def _open_connection(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Create the file owner-only; SQLite gives the -wal and -shm files the same mode.
+    os.close(os.open(path, os.O_RDWR | os.O_CREAT, 0o600))
+    os.chmod(path, 0o600)
+    conn = sqlite3.connect(
+        path,
+        timeout=_BUSY_TIMEOUT_MS / 1000,
+        isolation_level=None,
+        check_same_thread=False,
+    )
+    try:
+        conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+        mode = conn.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+        if str(mode).lower() != "wal":
+            raise StorageError(f"{path} could not be switched to WAL mode (got {mode!r})")
+        conn.execute("PRAGMA synchronous = FULL")
+        # Overwrite freed space so replaced plaintext doesn't linger in the file.
+        conn.execute("PRAGMA secure_delete = ON")
+        conn.executescript(_SCHEMA)
+        conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+def _connection() -> sqlite3.Connection:
+    """Return the shared connection for the current ``DATA_DIR``, opening it if needed."""
+    global _conn, _conn_path  # noqa: PLW0603
+    path = db_path()
+    if _conn is not None and _conn_path == path:
+        return _conn
+    close_db()
+    _conn = _open_connection(path)
+    _conn_path = path
+    return _conn
+
+
+def close_db() -> None:
+    """Close the shared connection, if one is open."""
+    global _conn, _conn_path  # noqa: PLW0603
+    with _conn_lock:
+        if _conn is not None:
+            _conn.close()
+        _conn = None
+        _conn_path = None
 
 
 @contextmanager
-def _file_lock(path: Path, exclusive: bool = True):
-    """Hold a lock on a sidecar file for *path*.
+def _transaction() -> Iterator[sqlite3.Connection]:
+    """Run a write transaction on the shared connection.
 
-    The sidecar keeps the same inode while *path* is replaced atomically, so
-    every reader and writer serializes on one lock.
+    ``BEGIN IMMEDIATE`` takes the write lock up front, so a read-modify-write
+    never races another process; the thread lock serializes this process's
+    callers on the one connection. Any SQLite failure is raised as
+    ``StorageError`` and the transaction is rolled back.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(_lock_path(path), "a+", encoding="utf-8") as lockf:
-        fcntl.flock(lockf, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+    with _conn_lock:
         try:
-            yield
-        finally:
-            fcntl.flock(lockf, fcntl.LOCK_UN)
-
-
-def _load_unlocked(path: Path) -> dict | list:
-    if not path.exists():
-        return {}
-    content = path.read_text(encoding="utf-8")
-    if not content.strip():
-        return {}
-    return json.loads(content)
-
-
-def _replace_unlocked(path: Path, data: dict | list) -> None:
-    tmp = path.with_suffix(".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with open(fd, "w", encoding="utf-8") as f:
-        f.write(json.dumps(data, indent=2))
-        f.flush()
-        os.fsync(f.fileno())
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
-    dir_fd = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
-
-
-def _read_json(path: Path) -> dict | list:
-    """Read and return parsed JSON from *path*, or an empty dict on failure."""
-    try:
-        with _file_lock(path, exclusive=False):
-            return _load_unlocked(path)
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("Failed to read %s: %s", path, exc)
-        return {}
-
-
-class StorageError(RuntimeError):
-    """A data file could not be read or written, so the change was not saved."""
-
-
-def _update_json(path: Path, update, default=dict):
-    """Read, modify and write *path* under one exclusive lock.
-
-    *update* mutates the loaded data in place and returns the caller's result.
-    Raises ``StorageError`` without touching the file if it can't be read, so a
-    damaged file is kept for recovery, or if the write fails.
-    """
-    with ExitStack() as stack:
+            conn = _connection()
+            conn.execute("BEGIN IMMEDIATE")
+        except (sqlite3.Error, OSError) as exc:
+            raise StorageError(f"Failed to open {db_path()}: {exc}") from exc
         try:
-            stack.enter_context(_file_lock(path))
-        except OSError as exc:
-            raise StorageError(f"Failed to lock {path}: {exc}") from exc
+            yield conn
+            conn.execute("COMMIT")
+        except BaseException as exc:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            if isinstance(exc, sqlite3.Error):
+                raise StorageError(f"Failed to write {db_path()}: {exc}") from exc
+            if isinstance(exc, (AttributeError, KeyError, TypeError, ValueError)):
+                raise StorageError(f"{db_path()} has a malformed record: {exc!r}") from exc
+            raise
+
+
+def _query(sql: str, params: tuple = ()) -> list[tuple]:
+    with _conn_lock:
         try:
-            data = _load_unlocked(path)
-        except (json.JSONDecodeError, OSError) as exc:
-            raise StorageError(f"Failed to read {path}: {exc}") from exc
-        empty = default()
-        if data == {}:
-            data = empty
-        if not isinstance(data, type(empty)):
-            raise StorageError(
-                f"{path} holds a JSON {type(data).__name__}, expected {type(empty).__name__}"
-            )
-        try:
-            result = update(data)
-        except (AttributeError, KeyError, TypeError, ValueError) as exc:
-            raise StorageError(f"{path} has a malformed record: {exc!r}") from exc
-        try:
-            _replace_unlocked(path, data)
-        except OSError as exc:
-            raise StorageError(f"Failed to write {path}: {exc}") from exc
-        return result
+            return _connection().execute(sql, params).fetchall()
+        except (sqlite3.Error, OSError) as exc:
+            raise StorageError(f"Failed to read {db_path()}: {exc}") from exc
 
 
-# ── Public API ──────────────────────────────────────────────────────────────
-
-
-def ensure_data_dir() -> None:
-    """Create the data directory tree if it does not exist."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    # Set restrictive permissions: owner read/write/execute only
-    os.chmod(DATA_DIR, 0o700)
-    logger.info("Data directory ready: %s", DATA_DIR.resolve())
+# ── Encryption helpers ──────────────────────────────────────────────────────
 
 
 def _encrypt(data: str) -> str:
@@ -207,98 +220,199 @@ def _decrypt(data: str) -> str:
         return "[DECRYPTION_FAILED]"
 
 
-def _seal_session(session: dict) -> dict:
-    """Encrypt a whole session record when a key is configured."""
+def _seal_session(session: dict) -> str:
+    """Serialize a session record, encrypting it whole when a key is configured."""
     if not _fernet:
-        return session
-    return {"enc": _encrypt(json.dumps(session))}
+        return json.dumps(session)
+    return json.dumps({"enc": _encrypt(json.dumps(session))})
 
 
 def _is_sealed(value) -> bool:
     return isinstance(value, dict) and set(value) == {"enc"}
 
 
-def _open_session(value) -> dict | None:
-    if not _is_sealed(value):
-        return value
+def _open_session(record: str) -> dict | None:
+    """Return the session stored in *record*, or ``None`` if it can't be read."""
     try:
-        return json.loads(_decrypt(value["enc"]))
-    except json.JSONDecodeError:
+        value = json.loads(record)
+        if _is_sealed(value):
+            value = json.loads(_decrypt(value["enc"]))
+    except (json.JSONDecodeError, TypeError):
         logger.error("Failed to decrypt a session record — key mismatch or corruption")
         return None
+    return value if isinstance(value, dict) else None
 
 
-def _encrypt_file_in_place(path: Path, encrypt_entries) -> int:
-    """Encrypt plaintext entries of one JSON file under its exclusive lock.
+# ── Startup ─────────────────────────────────────────────────────────────────
 
-    Errors propagate, including unreadable JSON, so startup fails rather than
-    leaving plaintext behind.
+
+def ensure_data_dir() -> None:
+    """Create the data directory if it does not exist."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # Set restrictive permissions: owner read/write/execute only
+    os.chmod(DATA_DIR, 0o700)
+    logger.info("Data directory ready: %s", DATA_DIR.resolve())
+
+
+def init_db() -> int:
+    """Open the database, check its integrity and import any v1.2 JSON files.
+
+    Runs at startup. Raises ``RuntimeError`` if the database fails
+    ``PRAGMA integrity_check`` or a legacy JSON file can't be parsed, so the
+    bridge doesn't start on damaged data. Returns the number of records
+    imported from JSON.
     """
-    if not path.exists():
-        return 0
-    with ExitStack() as stack:
+    with _conn_lock:
         try:
-            stack.enter_context(_file_lock(path))
-        except OSError as exc:
-            raise StorageError(f"Failed to lock {path}: {exc}") from exc
-        try:
-            data = _load_unlocked(path)
-        except json.JSONDecodeError as exc:
+            result = _connection().execute("PRAGMA integrity_check").fetchall()
+        except sqlite3.DatabaseError as exc:
             raise RuntimeError(
-                f"{path} is not valid JSON, so its contents cannot be encrypted. "
+                f"{db_path()} is not a readable SQLite database ({exc}). "
                 "Restore it from a backup or move it out of DATA_DIR, then restart."
             ) from exc
-        if not data:
-            return 0
-        migrated = encrypt_entries(data)
-        if migrated:
-            _replace_unlocked(path, data)
-        return migrated
+    problems = [row[0] for row in result if row[0] != "ok"]
+    if problems:
+        raise RuntimeError(
+            f"{db_path()} failed PRAGMA integrity_check: {'; '.join(problems[:5])}. "
+            "Restore it from a backup or move it out of DATA_DIR, then restart."
+        )
+    return _import_legacy_json()
 
 
-def _encrypt_session_entries(sessions: dict) -> int:
-    migrated = 0
-    for key, value in sessions.items():
-        if not _is_sealed(value):
-            sessions[key] = _seal_session(value)
-            migrated += 1
-    return migrated
+_LEGACY_FILES = ("sessions.json", "memories.json", "notes.json")
 
 
-def _encrypt_memory_facts(memories: dict) -> int:
-    migrated = 0
-    for store in memories.values():
-        facts = store.get("facts", [])
-        for i, fact in enumerate(facts):
-            if not fact.startswith(_FERNET_TOKEN_PREFIX):
-                facts[i] = _encrypt(fact)
-                migrated += 1
-    return migrated
+def _load_legacy(path: Path, expected: type) -> dict | list | None:
+    if not path.exists():
+        return None
+    content = path.read_text(encoding="utf-8")
+    if not content.strip():
+        return expected()
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"{path} is not valid JSON, so it cannot be imported into {DB_FILENAME}. "
+            "Restore it from a backup or move it out of DATA_DIR, then restart."
+        ) from exc
+    if data == {}:
+        data = expected()
+    if not isinstance(data, expected):
+        raise RuntimeError(
+            f"{path} holds a JSON {type(data).__name__}, expected {expected.__name__}. "
+            "Restore it from a backup or move it out of DATA_DIR, then restart."
+        )
+    return data
 
 
-def _encrypt_note_entries(all_notes: list) -> int:
-    migrated = 0
-    for entry in all_notes:
-        if not str(entry.get("note", "")).startswith(_FERNET_TOKEN_PREFIX):
-            entry["note"] = _encrypt(entry["note"])
-            migrated += 1
-    return migrated
+def _import_legacy_json() -> int:
+    """Move sessions.json, memories.json and notes.json into the database.
+
+    All three files are imported in one transaction, then each is renamed to
+    ``<name>.migrated`` so it is kept as a backup and never imported twice.
+    """
+    paths = {name: DATA_DIR / name for name in _LEGACY_FILES}
+    if not any(p.exists() for p in paths.values()):
+        return 0
+    sessions = _load_legacy(paths["sessions.json"], dict) or {}
+    memories = _load_legacy(paths["memories.json"], dict) or {}
+    notes = _load_legacy(paths["notes.json"], list) or []
+
+    try:
+        session_rows = [(phone_hash, json.dumps(value)) for phone_hash, value in sessions.items()]
+        memory_rows = [
+            (phone_hash, str(fact))
+            for phone_hash, store in memories.items()
+            for fact in (store or {}).get("facts", [])
+        ]
+        note_rows = [
+            (float(entry.get("timestamp", 0)), str(entry.get("note", "")), entry.get("phone_hash"))
+            for entry in notes
+        ]
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"A JSON file in {DATA_DIR} has a malformed record ({exc!r}), so nothing was "
+            "imported. Fix it or move it out of DATA_DIR, then restart."
+        ) from exc
+
+    with _transaction() as conn:
+        if conn.execute("SELECT 1 FROM meta WHERE key = 'legacy_json_imported'").fetchone():
+            # A crash after the commit left the files behind; don't import them twice.
+            logger.warning("JSON files in %s were already imported; renaming them", DATA_DIR)
+            session_rows, memory_rows, note_rows = [], [], []
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('legacy_json_imported', ?)",
+            (str(time.time()),),
+        )
+        conn.executemany(
+            "INSERT OR REPLACE INTO sessions (phone_hash, record) VALUES (?, ?)", session_rows
+        )
+        conn.executemany("INSERT INTO memories (phone_hash, fact) VALUES (?, ?)", memory_rows)
+        conn.executemany(
+            "INSERT INTO notes (timestamp, note, phone_hash) VALUES (?, ?, ?)", note_rows
+        )
+    imported = len(session_rows) + len(memory_rows) + len(note_rows)
+
+    for path in paths.values():
+        if path.exists():
+            path.replace(path.with_name(path.name + ".migrated"))
+        lock = path.with_name(path.name + ".lock")
+        if lock.exists():
+            lock.unlink()
+    logger.info("Imported %d records from JSON files into %s", imported, db_path())
+    return imported
 
 
 def encrypt_plaintext_entries() -> int:
     """Encrypt sessions, facts and notes written before encryption was enabled.
 
     Runs at startup when a key is configured. Values already carrying the Fernet
-    prefix are left alone. Returns the number of entries encrypted; raises if a
-    file cannot be read or rewritten.
+    prefix are left alone. Returns the number of entries encrypted; raises if
+    the database can't be read or written.
     """
     if not _fernet:
         return 0
-    return (
-        _encrypt_file_in_place(_sessions_path(), _encrypt_session_entries)
-        + _encrypt_file_in_place(_memories_path(), _encrypt_memory_facts)
-        + _encrypt_file_in_place(_notes_path(), _encrypt_note_entries)
-    )
+    migrated = 0
+    with _transaction() as conn:
+        for phone_hash, record in conn.execute("SELECT phone_hash, record FROM sessions").fetchall():
+            try:
+                value = json.loads(record)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"The session record for {phone_hash[:8]} is not valid JSON, so it "
+                    "cannot be encrypted."
+                ) from exc
+            if not _is_sealed(value):
+                conn.execute(
+                    "UPDATE sessions SET record = ? WHERE phone_hash = ?",
+                    (_seal_session(value), phone_hash),
+                )
+                migrated += 1
+        for table, column in (("memories", "fact"), ("notes", "note")):
+            rows = conn.execute(
+                f"SELECT id, {column} FROM {table} WHERE substr({column}, 1, ?) != ?",
+                (len(_FERNET_TOKEN_PREFIX), _FERNET_TOKEN_PREFIX),
+            ).fetchall()
+            for row_id, value in rows:
+                conn.execute(
+                    f"UPDATE {table} SET {column} = ? WHERE id = ?", (_encrypt(value), row_id)
+                )
+            migrated += len(rows)
+    if migrated:
+        _checkpoint()
+    return migrated
+
+
+def _checkpoint() -> None:
+    """Copy the WAL into the database and truncate it, dropping old page versions."""
+    with _conn_lock:
+        try:
+            _connection().execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error as exc:
+            raise StorageError(f"Failed to checkpoint {db_path()}: {exc}") from exc
+
+
+# ── Public API ──────────────────────────────────────────────────────────────
 
 
 def load_session(phone_hash: str) -> Session:
@@ -308,17 +422,28 @@ def load_session(phone_hash: str) -> Session:
     this function is called (i.e., per inbound call).
     """
     try:
-        return _update_json(_sessions_path(), lambda sessions: _touch_session(sessions, phone_hash))
+        with _transaction() as conn:
+            row = conn.execute(
+                "SELECT record FROM sessions WHERE phone_hash = ?", (phone_hash,)
+            ).fetchone()
+            session, unreadable = _touch_session(row[0] if row else None, phone_hash)
+            if not unreadable:
+                # Leave an undecryptable record alone so restoring the right key recovers it.
+                conn.execute(
+                    "INSERT OR REPLACE INTO sessions (phone_hash, record) VALUES (?, ?)",
+                    (phone_hash, _seal_session(session)),
+                )
+            return session
     except StorageError as exc:
         # The call still goes ahead, without persisted history.
         logger.error("%s; using a temporary session", exc)
-        return _touch_session({}, phone_hash)
+        return _touch_session(None, phone_hash)[0]
 
 
-def _touch_session(sessions: dict, phone_hash: str) -> Session:
+def _touch_session(record: str | None, phone_hash: str) -> tuple[Session, bool]:
     now = time.time()
-    session = _open_session(sessions.get(phone_hash)) if phone_hash in sessions else None
-    unreadable = phone_hash in sessions and session is None
+    session = _open_session(record) if record is not None else None
+    unreadable = record is not None and session is None
     if unreadable:
         logger.warning(
             "Session record for %s can't be decrypted (wrong or missing key); "
@@ -347,81 +472,72 @@ def _touch_session(sessions: dict, phone_hash: str) -> Session:
             active=True,
         )
         logger.info("New caller %s", phone_hash[:8])
-
-    if not unreadable:
-        # Leave an undecryptable record alone so restoring the right key recovers it.
-        sessions[phone_hash] = _seal_session(session)
-    return session
+    return session, unreadable  # type: ignore[return-value]
 
 
 def end_session(phone_hash: str, call_sid: str) -> None:
     """Mark the session for *phone_hash* as inactive after a call ends."""
-
-    def update(sessions: dict) -> None:
-        session = _open_session(sessions.get(phone_hash))
-        if session is not None:
-            session["active"] = False
-            session["last_call_sid"] = call_sid
-            sessions[phone_hash] = _seal_session(session)
-
     try:
-        _update_json(_sessions_path(), update)
+        with _transaction() as conn:
+            row = conn.execute(
+                "SELECT record FROM sessions WHERE phone_hash = ?", (phone_hash,)
+            ).fetchone()
+            session = _open_session(row[0]) if row else None
+            if session is not None:
+                session["active"] = False
+                session["last_call_sid"] = call_sid
+                conn.execute(
+                    "UPDATE sessions SET record = ? WHERE phone_hash = ?",
+                    (_seal_session(session), phone_hash),
+                )
     except StorageError as exc:
         logger.error("%s; session end not recorded", exc)
 
 
 def get_memories(phone_hash: str) -> list[str]:
-    """Return the list of stored facts for *phone_hash*."""
-    memories: dict[str, MemoryStore] = _read_json(_memories_path())  # type: ignore[assignment]
-    store = memories.get(phone_hash, {})
-    facts = store.get("facts", [])
-    # Decrypt facts if encryption is enabled
-    if _fernet:
-        decrypted = []
-        for fact in facts:
-            try:
-                decrypted.append(_decrypt(fact))
-            except Exception:
-                # Fallback: fact was stored unencrypted
-                decrypted.append(fact)
-        return decrypted
-    return facts
+    """Return the stored facts for *phone_hash*, oldest first."""
+    try:
+        rows = _query("SELECT fact FROM memories WHERE phone_hash = ? ORDER BY id", (phone_hash,))
+    except StorageError as exc:
+        logger.warning("%s", exc)
+        return []
+    return [_decrypt(fact) for (fact,) in rows]
 
 
 def add_memory(phone_hash: str, fact: str) -> list[str]:
     """Append *fact* to long-term memory for *phone_hash*.
 
-    Returns the updated list of facts.
+    Returns the caller's facts as stored (encrypted when a key is configured).
     """
-    stored_fact = _encrypt(fact) if _fernet else fact
-
-    def update(memories: dict) -> list[str]:
-        store = memories.setdefault(phone_hash, MemoryStore(phone_hash=phone_hash, facts=[]))
-        store.setdefault("facts", []).append(stored_fact)
-        return store["facts"]
-
-    facts = _update_json(_memories_path(), update)
+    with _transaction() as conn:
+        conn.execute(
+            "INSERT INTO memories (phone_hash, fact) VALUES (?, ?)", (phone_hash, _encrypt(fact))
+        )
+        facts = [
+            stored
+            for (stored,) in conn.execute(
+                "SELECT fact FROM memories WHERE phone_hash = ? ORDER BY id", (phone_hash,)
+            )
+        ]
     logger.info("Stored fact for %s (total: %d)", phone_hash[:8], len(facts))
     return facts
 
 
 def get_notes(phone_hash: str | None = None) -> list[Note]:
-    """Return notes, optionally filtered by *phone_hash*.
+    """Return notes, optionally filtered by *phone_hash*, oldest first.
 
     Global notes (``phone_hash is None``) are always included.
     """
-    all_notes: list[Note] = _read_json(_notes_path()) or []  # type: ignore[assignment]
-    notes = [
-        n
-        for n in all_notes
-        if n.get("phone_hash") is None or n.get("phone_hash") == phone_hash
-    ]
-    # Decrypt note content if encryption is enabled
-    if _fernet:
-        for note in notes:
-            if "note" in note:
-                note["note"] = _decrypt(note["note"])
-    return notes
+    try:
+        rows = _query(
+            "SELECT timestamp, note, phone_hash FROM notes "
+            "WHERE phone_hash IS NULL OR phone_hash = ? ORDER BY id",
+            (phone_hash,),
+        )
+    except StorageError as exc:
+        logger.warning("%s", exc)
+        return []
+    return [Note(timestamp=ts, note=_decrypt(note), phone_hash=ph) for ts, note, ph in rows]
 
 
 def add_note(note: str, phone_hash: str | None = None) -> Note:
@@ -430,11 +546,38 @@ def add_note(note: str, phone_hash: str | None = None) -> Note:
     If *phone_hash* is provided the note is scoped to that caller; otherwise
     it is a global/daily note visible to all callers.
     """
-    stored_note = _encrypt(note) if _fernet else note
-    entry = Note(timestamp=time.time(), note=stored_note, phone_hash=phone_hash)
-    _update_json(_notes_path(), lambda all_notes: all_notes.append(dict(entry)), default=list)
+    entry = Note(timestamp=time.time(), note=note, phone_hash=phone_hash)
+    with _transaction() as conn:
+        conn.execute(
+            "INSERT INTO notes (timestamp, note, phone_hash) VALUES (?, ?, ?)",
+            (entry["timestamp"], _encrypt(note), phone_hash),
+        )
     logger.info("Added note (global=%s)", phone_hash is None)
-    # Return decrypted version for display
-    if _fernet:
-        entry["note"] = note
     return entry
+
+
+def backup(dest: str | Path) -> Path:
+    """Write a consistent copy of the live database to *dest* with ``VACUUM INTO``.
+
+    Safe while the bridge is serving calls, unlike copying ``bridge.db`` and
+    its ``-wal`` file. *dest* must not exist yet.
+    """
+    dest = Path(dest)
+    if dest.exists():
+        raise FileExistsError(f"{dest} already exists")
+    with _conn_lock:
+        try:
+            _connection().execute("VACUUM INTO ?", (str(dest),))
+        except sqlite3.Error as exc:
+            raise StorageError(f"Failed to back up {db_path()} to {dest}: {exc}") from exc
+    os.chmod(dest, 0o600)
+    return dest
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) != 3 or sys.argv[1] != "backup":
+        sys.exit("usage: python memory.py backup <dest.db>")
+    logging.basicConfig(level=logging.INFO)
+    print(backup(sys.argv[2]))

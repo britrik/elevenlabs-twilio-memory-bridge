@@ -70,8 +70,8 @@ def test_startup_migration_encrypts_legacy_entries(tmp_path, monkeypatch):
     monkeypatch.setattr(memory_module, "_fernet", Fernet(Fernet.generate_key()))
     assert memory_module.encrypt_plaintext_entries() == 2
     assert memory_module.encrypt_plaintext_entries() == 0
-    raw = (tmp_path / "memories.json").read_text() + (tmp_path / "notes.json").read_text()
-    assert "likes jazz" not in raw and "old note" not in raw
+    raw = _raw_db(tmp_path)
+    assert b"likes jazz" not in raw and b"old note" not in raw
     assert memory_module.get_memories("hash1") == ["likes jazz"]
     assert [n["note"] for n in memory_module.get_notes("hash1")] == ["old note"]
 
@@ -107,15 +107,24 @@ def test_migration_failure_is_not_swallowed(tmp_path, monkeypatch):
     monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
     monkeypatch.setattr(memory_module, "_fernet", None)
     memory_module.add_memory("hash1", "likes jazz")
+    memory_module.add_memory("hash1", "prefers mornings")
     monkeypatch.setattr(memory_module, "_fernet", Fernet(Fernet.generate_key()))
 
-    def fail_fsync(_fd):
-        raise OSError("No space left on device")
+    real_encrypt = memory_module._encrypt
+    calls = []
 
-    monkeypatch.setattr(memory_module.os, "fsync", fail_fsync)
+    def fail_second(data):
+        calls.append(data)
+        if len(calls) == 2:
+            raise OSError("No space left on device")
+        return real_encrypt(data)
+
+    monkeypatch.setattr(memory_module, "_encrypt", fail_second)
     with pytest.raises(OSError):
         memory_module.encrypt_plaintext_entries()
-    assert "likes jazz" in (tmp_path / "memories.json").read_text()
+    # The whole migration rolled back, so nothing is half-encrypted.
+    stored = memory_module._query("SELECT fact FROM memories ORDER BY id")
+    assert stored == [("likes jazz",), ("prefers mornings",)]
 
 
 def test_sanitise_keeps_meaningful_leading_characters():
@@ -134,7 +143,7 @@ def test_migration_fails_closed_on_corrupt_files(tmp_path, monkeypatch):
     monkeypatch.setattr(memory_module, "_fernet", Fernet(Fernet.generate_key()))
     (tmp_path / "memories.json").write_text("{not json")
     with pytest.raises(RuntimeError, match="not valid JSON"):
-        memory_module.encrypt_plaintext_entries()
+        memory_module.init_db()
     assert (tmp_path / "memories.json").read_text() == "{not json"
 
 
@@ -154,8 +163,8 @@ def test_sessions_are_encrypted_at_rest_and_migrated(tmp_path, monkeypatch):
     assert session["call_count"] == 2
     memory_module.load_session("newhash")
     memory_module.end_session("newhash", "CA123")
-    raw = (tmp_path / "sessions.json").read_text()
-    assert "call_count" not in raw and "CA123" not in raw
+    raw = _raw_db(tmp_path)
+    assert b"call_count" not in raw and b"CA123" not in raw
     assert memory_module.load_session("newhash")["last_call_sid"] == "CA123"
 
 
@@ -186,75 +195,63 @@ def test_unreadable_session_is_not_overwritten(tmp_path, monkeypatch):
     monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
     monkeypatch.setattr(memory_module, "_fernet", Fernet(Fernet.generate_key()))
     memory_module.load_session("hash1")
-    before = (tmp_path / "sessions.json").read_text()
+    before = memory_module._query("SELECT record FROM sessions")
     monkeypatch.setattr(memory_module, "_fernet", Fernet(Fernet.generate_key()))
     assert memory_module.load_session("hash1")["call_count"] == 1
-    assert (tmp_path / "sessions.json").read_text() == before
-
-
-def test_updates_never_replace_an_unreadable_file(tmp_path, monkeypatch):
-    import memory as memory_module
-
-    monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(memory_module, "_fernet", None)
-    (tmp_path / "sessions.json").write_text("{damaged")
     memory_module.end_session("hash1", "CA1")
-    memory_module.load_session("hash1")
-    assert (tmp_path / "sessions.json").read_text() == "{damaged"
+    assert memory_module._query("SELECT record FROM sessions") == before
 
 
-def test_writes_to_an_unreadable_file_raise_instead_of_reporting_success(tmp_path, monkeypatch):
+def test_writes_to_an_unreadable_database_raise_instead_of_reporting_success(tmp_path, monkeypatch):
     import pytest
 
     import memory as memory_module
 
     monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
     monkeypatch.setattr(memory_module, "_fernet", None)
-    (tmp_path / "memories.json").write_text("{damaged")
-    (tmp_path / "notes.json").write_text("[damaged")
+    damaged = b"this is not a sqlite database" * 200
+    (tmp_path / "bridge.db").write_bytes(damaged)
     with pytest.raises(memory_module.StorageError):
         memory_module.add_memory("hash1", "likes tea")
     with pytest.raises(memory_module.StorageError):
         memory_module.add_note("note")
-    assert (tmp_path / "memories.json").read_text() == "{damaged"
-
-
-def test_wrong_shape_json_raises_storage_error_and_is_kept(tmp_path, monkeypatch):
-    import pytest
-
-    import memory as memory_module
-
-    monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(memory_module, "_fernet", None)
-    cases = [
-        ("memories.json", "null", lambda: memory_module.add_memory("hash1", "fact")),
-        ("memories.json", '{"hash1": "not a record"}', lambda: memory_module.add_memory("hash1", "fact")),
-        ("notes.json", '{"a": 1}', lambda: memory_module.add_note("note")),
-        ("sessions.json", "[1, 2]", lambda: memory_module._update_json(
-            memory_module._sessions_path(), lambda s: memory_module._touch_session(s, "hash1"))),
-        ("sessions.json", '{"hash1": {"call_count": "x"}}', lambda: memory_module._update_json(
-            memory_module._sessions_path(), lambda s: memory_module._touch_session(s, "hash1"))),
-    ]
-    for name, content, call in cases:
-        (tmp_path / name).write_text(content)
-        with pytest.raises(memory_module.StorageError):
-            call()
-        assert (tmp_path / name).read_text() == content
-    (tmp_path / "sessions.json").write_text("[1, 2]")
+    memory_module.end_session("hash1", "CA1")
     assert memory_module.load_session("hash1")["call_count"] == 1
+    assert memory_module.get_memories("hash1") == []
+    assert memory_module.get_notes("hash1") == []
+    assert (tmp_path / "bridge.db").read_bytes() == damaged
 
 
-def test_lock_failure_raises_storage_error(tmp_path, monkeypatch):
+def test_malformed_session_records_are_kept(tmp_path, monkeypatch):
+    import memory as memory_module
+
+    monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(memory_module, "_fernet", None)
+    for record in ("[1, 2]", "not json", '{"call_count": "x"}'):
+        with memory_module._transaction() as conn:
+            conn.execute("INSERT OR REPLACE INTO sessions VALUES ('hash1', ?)", (record,))
+        assert memory_module.load_session("hash1")["call_count"] == 1
+        assert memory_module._query("SELECT record FROM sessions") == [(record,)]
+
+
+def test_open_failure_raises_storage_error(tmp_path, monkeypatch):
     import pytest
 
     import memory as memory_module
 
     monkeypatch.setattr(memory_module, "DATA_DIR", tmp_path)
     monkeypatch.setattr(memory_module, "_fernet", None)
+    memory_module.close_db()
 
-    def no_lock(path, exclusive=True):
+    def no_open(path):
         raise PermissionError("denied")
 
-    monkeypatch.setattr(memory_module, "_file_lock", no_lock)
+    monkeypatch.setattr(memory_module, "_open_connection", no_open)
     with pytest.raises(memory_module.StorageError):
         memory_module.add_memory("hash1", "fact")
+    assert memory_module.get_memories("hash1") == []
+
+
+def _raw_db(tmp_path):
+    """Return the bytes of the database and its WAL, as they sit on disk."""
+    return b"".join(p.read_bytes() for p in sorted(tmp_path.glob("bridge.db*")))
