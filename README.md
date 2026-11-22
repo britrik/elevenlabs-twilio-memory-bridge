@@ -28,7 +28,7 @@ A lightweight production bridge that adds **persistent caller memory** and **dyn
                   │  Notes    │ Soul  │
                   └──────────────────┘
                          │
-                    ./data/ (JSON)
+                 ./data/bridge.db (SQLite)
 ```
 
 **Key insight:** ElevenLabs handles ALL real-time audio streaming directly with Twilio via their native integration. This service only runs the personalization webhook — it never touches audio data. This keeps the bridge tiny, fast, and cheap to host.
@@ -213,7 +213,7 @@ curl -X POST http://localhost:8000/api/notes \
 ```
 elevenlabs-twilio-memory-bridge/
 ├── app.py                 # FastAPI application & webhook endpoints
-├── memory.py              # File-based session, memory, and notes persistence
+├── memory.py              # SQLite session, memory, and notes persistence
 ├── soul_template.md       # Default agent personality template
 ├── requirements.txt       # Python dependencies
 ├── manifest.json          # ClawHub skill metadata
@@ -221,9 +221,7 @@ elevenlabs-twilio-memory-bridge/
 ├── .gitignore             # Git exclusions
 ├── README.md              # This file
 └── data/                  # Runtime data (git-ignored)
-    ├── sessions/          # Per-caller session JSON files
-    ├── memories/          # Per-caller long-term facts
-    └── notes/             # Daily context notes
+    └── bridge.db          # SQLite database (sessions, memories, notes) plus -wal/-shm files
 ```
 
 ## Security
@@ -233,8 +231,9 @@ elevenlabs-twilio-memory-bridge/
 - **Mandatory webhook verification** — `WEBHOOK_SECRET` is required. Webhooks are rejected with 401 if the secret is not configured (fail-closed).
 - **Rate limiting** — webhook endpoints limited to 60 requests/minute, admin endpoints to 30 requests/minute per IP.
 - **Encryption at rest** — session records, memories and notes are encrypted with Fernet. Startup fails without `DATA_ENCRYPTION_KEY` unless you explicitly set `ALLOW_PLAINTEXT_STORAGE=true`.
-- **File permissions** — data directory created with `0o700`, JSON files written with `0o600`.
-- **File locking** — POSIX advisory locks (`fcntl`) prevent race conditions on concurrent reads/writes.
+- **File permissions** — data directory created with `0o700`, the SQLite database and its WAL files with `0o600`.
+- **Concurrent writes** — SQLite runs in WAL mode with a 5 s busy timeout, and every read-modify-write runs in one `BEGIN IMMEDIATE` transaction, so concurrent calls don't lose updates.
+- **Integrity check** — startup runs `PRAGMA integrity_check` and refuses to start on a damaged database.
 - **Startup validation** — the app refuses to start if `PHONE_HASH_SALT` or `WEBHOOK_SECRET` are not set.
 - **Use scoped API keys** — limit ElevenLabs and OpenClaw keys to minimum required permissions
 - **HTTPS only** — both OpenClaw and the bridge should be behind TLS in production

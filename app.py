@@ -44,8 +44,11 @@ from memory import (
     StorageError,
     add_memory,
     add_note,
+    close_db,
+    db_path,
     end_session,
     ensure_data_dir,
+    init_db,
     get_memories,
     get_notes,
     load_session,
@@ -400,6 +403,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.warning("ALLOW_PLAINTEXT_STORAGE=true — caller memories are stored unencrypted")
 
     ensure_data_dir()
+    imported = init_db()
+    if imported:
+        logger.info("Imported %d records from the v1.2 JSON files into SQLite", imported)
     migrated = encrypt_plaintext_entries()
     if migrated:
         logger.info("Encrypted %d memory entries written before encryption was enabled", migrated)
@@ -407,10 +413,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     logger.info("Bridge starting — agent_id=%s", ELEVENLABS_AGENT_ID or "(not set)")
     logger.info("Public URL: %s", PUBLIC_BASE_URL or "(not set)")
-    logger.info("Data dir:   %s", Path(DATA_DIR).resolve())
+    logger.info("Database:   %s", db_path().resolve())
     logger.info("Webhook signature verification: enabled")
-    yield
-    logger.info("Bridge shutting down")
+    try:
+        yield
+    finally:
+        close_db()
+        logger.info("Bridge shutting down")
 
 
 # ── Rate limiting ───────────────────────────────────────────────────────────
@@ -421,7 +430,7 @@ limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
     title="ElevenLabs–Twilio Memory Bridge",
-    version="1.2.4",
+    version="1.3.0",
     description=(
         "Personalization webhook for ElevenLabs' native Twilio integration. "
         "Injects caller memory and personality into each conversation."
